@@ -6,7 +6,10 @@ package oauth2
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing" //"time"
 
 	"time"
@@ -671,4 +674,152 @@ func TestAuthorizeCodeTransactional_HandleTokenEndpointRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// snapshotTransactionalStore wraps the memory store with snapshot-based
+// transactions and failure injection, so tests can verify that a failed
+// authorize code exchange is rolled back and stays retryable.
+type snapshotTransactionalStore struct {
+	*storage.MemoryStore
+
+	failCreateAccessTokenSession bool
+
+	txAuthorizeCodes        map[string]storage.StoreAuthorizeCode
+	txAccessTokens          map[string]fosite.Requester
+	txAccessTokenRequestIDs map[string]string
+}
+
+func (s *snapshotTransactionalStore) BeginTX(ctx context.Context) (context.Context, error) {
+	s.txAuthorizeCodes = maps.Clone(s.AuthorizeCodes)
+	s.txAccessTokens = maps.Clone(s.AccessTokens)
+	s.txAccessTokenRequestIDs = maps.Clone(s.AccessTokenRequestIDs)
+	return ctx, nil
+}
+
+func (s *snapshotTransactionalStore) Commit(_ context.Context) error {
+	s.txAuthorizeCodes = nil
+	s.txAccessTokens = nil
+	s.txAccessTokenRequestIDs = nil
+	return nil
+}
+
+func (s *snapshotTransactionalStore) Rollback(_ context.Context) error {
+	s.AuthorizeCodes = s.txAuthorizeCodes
+	s.AccessTokens = s.txAccessTokens
+	s.AccessTokenRequestIDs = s.txAccessTokenRequestIDs
+	return nil
+}
+
+func (s *snapshotTransactionalStore) CreateAccessTokenSession(ctx context.Context, signature string, request fosite.Requester) error {
+	if s.failCreateAccessTokenSession {
+		return errors.New("injected storage failure")
+	}
+	return s.MemoryStore.CreateAccessTokenSession(ctx, signature, request)
+}
+
+func TestAuthorizeCode_FailedExchangeIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	store := &snapshotTransactionalStore{MemoryStore: storage.NewMemoryStore()}
+	h := AuthorizeExplicitGrantHandler{
+		CoreStorage:            store,
+		TokenRevocationStorage: store,
+		AuthorizeCodeStrategy:  hmacshaStrategy,
+		AccessTokenStrategy:    hmacshaStrategy,
+		RefreshTokenStrategy:   hmacshaStrategy,
+		Config: &fosite.Config{
+			ScopeStrategy:            fosite.HierarchicScopeStrategy,
+			AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+			AccessTokenLifespan:      time.Minute,
+			RefreshTokenScopes:       []string{"offline"},
+		},
+	}
+
+	client := &fosite.DefaultClient{GrantTypes: fosite.Arguments{"authorization_code"}}
+	areq := fosite.NewAuthorizeRequest()
+	areq.Client = client
+	areq.Session = &fosite.DefaultSession{}
+	code, signature, err := hmacshaStrategy.GenerateAuthorizeCode(ctx, areq)
+	require.NoError(t, err)
+	require.NoError(t, store.CreateAuthorizeCodeSession(ctx, signature, areq))
+
+	newTokenRequest := func() *fosite.AccessRequest {
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"authorization_code"}
+		r.Client = client
+		r.Form.Set("code", code)
+		return r
+	}
+
+	// The first exchange fails because of an injected storage error.
+	store.failCreateAccessTokenSession = true
+	first := newTokenRequest()
+	require.NoError(t, h.HandleTokenEndpointRequest(ctx, first))
+	require.Error(t, h.PopulateTokenEndpointResponse(ctx, first, fosite.NewAccessResponse()))
+
+	// The rollback must have kept the authorize code valid.
+	_, err = store.GetAuthorizeCodeSession(ctx, signature, nil)
+	require.NoError(t, err)
+
+	// The retry succeeds and consumes the code.
+	store.failCreateAccessTokenSession = false
+	second := newTokenRequest()
+	require.NoError(t, h.HandleTokenEndpointRequest(ctx, second))
+	resp := fosite.NewAccessResponse()
+	require.NoError(t, h.PopulateTokenEndpointResponse(ctx, second, resp))
+	require.NotEmpty(t, resp.GetAccessToken())
+
+	_, err = store.GetAuthorizeCodeSession(ctx, signature, nil)
+	require.ErrorIs(t, err, fosite.ErrInvalidatedAuthorizeCode)
+
+	// The code cannot be exchanged again.
+	require.Error(t, h.HandleTokenEndpointRequest(ctx, newTokenRequest()))
+}
+
+func TestAuthorizeCode_ConcurrentExchangeSucceedsOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	store := storage.NewMemoryStore()
+	h := AuthorizeExplicitGrantHandler{
+		CoreStorage:            store,
+		TokenRevocationStorage: store,
+		AuthorizeCodeStrategy:  hmacshaStrategy,
+		AccessTokenStrategy:    hmacshaStrategy,
+		RefreshTokenStrategy:   hmacshaStrategy,
+		Config: &fosite.Config{
+			ScopeStrategy:            fosite.HierarchicScopeStrategy,
+			AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+			AccessTokenLifespan:      time.Minute,
+			RefreshTokenScopes:       []string{"offline"},
+		},
+	}
+
+	client := &fosite.DefaultClient{GrantTypes: fosite.Arguments{"authorization_code"}}
+	areq := fosite.NewAuthorizeRequest()
+	areq.Client = client
+	areq.Session = &fosite.DefaultSession{}
+	code, signature, err := hmacshaStrategy.GenerateAuthorizeCode(ctx, areq)
+	require.NoError(t, err)
+	require.NoError(t, store.CreateAuthorizeCodeSession(ctx, signature, areq))
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	var succeeded atomic.Int64
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+			r.GrantTypes = fosite.Arguments{"authorization_code"}
+			r.Client = client
+			r.Form.Set("code", code)
+			if err := h.PopulateTokenEndpointResponse(ctx, r, fosite.NewAccessResponse()); err != nil {
+				return
+			}
+			succeeded.Add(1)
+		}()
+	}
+	wg.Wait()
+
+	require.EqualValues(t, 1, succeeded.Load(), "exactly one concurrent exchange may succeed")
+	_, err = store.GetAuthorizeCodeSession(ctx, signature, nil)
+	require.ErrorIs(t, err, fosite.ErrInvalidatedAuthorizeCode)
 }

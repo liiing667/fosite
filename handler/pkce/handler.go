@@ -146,10 +146,6 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
-	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
-		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
-	}
-
 	challenge := pkceRequest.GetRequestForm().Get("code_challenge")
 	method := pkceRequest.GetRequestForm().Get("code_challenge_method")
 	client := pkceRequest.GetClient()
@@ -230,6 +226,19 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 }
 
 func (c *Handler) PopulateTokenEndpointResponse(ctx context.Context, requester fosite.AccessRequester, responder fosite.AccessResponder) error {
+	if !c.CanHandleTokenEndpointRequest(ctx, requester) {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	// The PKCE session is consumed only after the authorize code has been
+	// exchanged for tokens successfully. Deleting it here (and not during
+	// request validation) keeps the PKCE binding intact when token creation
+	// fails, so that a legitimate retry can still succeed.
+	signature := c.AuthorizeCodeStrategy.AuthorizeCodeSignature(ctx, requester.GetRequestForm().Get("code"))
+	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
+		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
+	}
+
 	return nil
 }
 

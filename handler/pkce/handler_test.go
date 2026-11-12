@@ -8,7 +8,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -17,6 +19,7 @@ import (
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/handler/oauth2"
 	"github.com/ory/fosite/storage"
+	"github.com/ory/fosite/token/hmac"
 )
 
 type mockCodeStrategy struct {
@@ -389,6 +392,206 @@ func TestPKCEHandleTokenEndpointRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+type injectableCoreStorage struct {
+	*storage.MemoryStore
+	createAccessTokenSessionErr error
+	deletePKCERequestSessionErr error
+
+	txAuthorizeCodes        map[string]storage.StoreAuthorizeCode
+	txAccessTokens          map[string]fosite.Requester
+	txAccessTokenRequestIDs map[string]string
+}
+
+func (s *injectableCoreStorage) BeginTX(ctx context.Context) (context.Context, error) {
+	s.txAuthorizeCodes = maps.Clone(s.AuthorizeCodes)
+	s.txAccessTokens = maps.Clone(s.AccessTokens)
+	s.txAccessTokenRequestIDs = maps.Clone(s.AccessTokenRequestIDs)
+	return ctx, nil
+}
+
+func (s *injectableCoreStorage) Commit(_ context.Context) error {
+	s.txAuthorizeCodes = nil
+	s.txAccessTokens = nil
+	s.txAccessTokenRequestIDs = nil
+	return nil
+}
+
+func (s *injectableCoreStorage) Rollback(_ context.Context) error {
+	s.AuthorizeCodes = s.txAuthorizeCodes
+	s.AccessTokens = s.txAccessTokens
+	s.AccessTokenRequestIDs = s.txAccessTokenRequestIDs
+	return nil
+}
+
+func (s *injectableCoreStorage) CreateAccessTokenSession(ctx context.Context, signature string, request fosite.Requester) error {
+	if s.createAccessTokenSessionErr != nil {
+		return s.createAccessTokenSessionErr
+	}
+	return s.MemoryStore.CreateAccessTokenSession(ctx, signature, request)
+}
+
+func (s *injectableCoreStorage) DeletePKCERequestSession(ctx context.Context, signature string) error {
+	if s.deletePKCERequestSessionErr != nil {
+		return s.deletePKCERequestSessionErr
+	}
+	return s.MemoryStore.DeletePKCERequestSession(ctx, signature)
+}
+
+// TestPKCEExchangeFailureRecovery runs the authorize code exchange through the
+// oauth2 and pkce handlers (in the same order fosite.Compose would) and asserts
+// that a storage failure during token creation leaves both the authorize code
+// and the PKCE session untouched, so that a legitimate retry can succeed.
+func TestPKCEExchangeFailureRecovery(t *testing.T) {
+	ctx := context.Background()
+	config := &fosite.Config{
+		GlobalSecret:             []byte("foobarfoobarfoobarfoobarfoobarfoobarfoobarfoobar"),
+		AccessTokenLifespan:      time.Minute,
+		AuthorizeCodeLifespan:    time.Minute,
+		ScopeStrategy:            fosite.HierarchicScopeStrategy,
+		AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+		RefreshTokenScopes:       []string{"offline"},
+	}
+	store := &injectableCoreStorage{MemoryStore: storage.NewMemoryStore()}
+	strategy := oauth2.NewHMACSHAStrategy(&hmac.HMACStrategy{Config: config}, config)
+	coreHandler := &oauth2.AuthorizeExplicitGrantHandler{
+		AccessTokenStrategy:    strategy,
+		RefreshTokenStrategy:   strategy,
+		AuthorizeCodeStrategy:  strategy,
+		CoreStorage:            store,
+		TokenRevocationStorage: store,
+		Config:                 config,
+	}
+	pkceHandler := &Handler{
+		Storage:               store,
+		AuthorizeCodeStrategy: strategy,
+		Config:                config,
+	}
+
+	client := &fosite.DefaultClient{GrantTypes: fosite.Arguments{"authorization_code"}}
+	verifier := "KGCt4m8AmjUvIR5ArTByrmehjtbxn1A49YpTZhsH8N7fhDr7LQayn9xx6mck"
+	hash := sha256.New()
+	_, err := hash.Write([]byte(verifier))
+	require.NoError(t, err)
+	challenge := base64.RawURLEncoding.EncodeToString(hash.Sum([]byte{}))
+
+	areq := fosite.NewAuthorizeRequest()
+	areq.Client = client
+	areq.Session = &fosite.DefaultSession{}
+	areq.Form.Set("code_challenge", challenge)
+	areq.Form.Set("code_challenge_method", "S256")
+
+	code, signature, err := strategy.GenerateAuthorizeCode(ctx, areq)
+	require.NoError(t, err)
+	require.NoError(t, store.CreateAuthorizeCodeSession(ctx, signature, areq))
+	require.NoError(t, store.CreatePKCERequestSession(ctx, signature, areq))
+
+	newTokenRequest := func(withVerifier bool) *fosite.AccessRequest {
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"authorization_code"}
+		r.Client = client
+		r.Form.Set("code", code)
+		if withVerifier {
+			r.Form.Set("code_verifier", verifier)
+		}
+		return r
+	}
+
+	// exchange runs the token endpoint handlers in compose order and aborts on
+	// the first error, exactly like fosite.NewAccessRequest/NewAccessResponse.
+	exchange := func(r *fosite.AccessRequest) (*fosite.AccessResponse, error) {
+		if err := pkceHandler.HandleTokenEndpointRequest(ctx, r); err != nil {
+			return nil, err
+		}
+		if err := coreHandler.HandleTokenEndpointRequest(ctx, r); err != nil {
+			return nil, err
+		}
+		resp := fosite.NewAccessResponse()
+		if err := coreHandler.PopulateTokenEndpointResponse(ctx, r, resp); err != nil {
+			return nil, err
+		}
+		if err := pkceHandler.PopulateTokenEndpointResponse(ctx, r, resp); err != nil {
+			return nil, err
+		}
+		return resp, nil
+	}
+
+	// The first exchange fails because of an injected storage error during token creation.
+	store.createAccessTokenSessionErr = errors.New("injected storage failure")
+	_, err = exchange(newTokenRequest(true))
+	require.Error(t, err)
+
+	// Both the authorize code and the PKCE session must still be intact.
+	_, err = store.GetAuthorizeCodeSession(ctx, signature, nil)
+	require.NoError(t, err)
+	_, err = store.GetPKCERequestSession(ctx, signature, nil)
+	require.NoError(t, err)
+
+	// PKCE is not enforced, but the binding survived the failure: a retry
+	// without a verifier must not be able to bypass the challenge.
+	_, err = exchange(newTokenRequest(false))
+	require.EqualError(t, err, fosite.ErrInvalidGrant.Error())
+
+	// A legitimate retry with the correct verifier succeeds.
+	store.createAccessTokenSessionErr = nil
+	resp, err := exchange(newTokenRequest(true))
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.GetAccessToken())
+
+	// The exchange consumed both the authorize code and the PKCE session.
+	_, err = store.GetAuthorizeCodeSession(ctx, signature, nil)
+	require.ErrorIs(t, err, fosite.ErrInvalidatedAuthorizeCode)
+	_, err = store.GetPKCERequestSession(ctx, signature, nil)
+	require.ErrorIs(t, err, fosite.ErrNotFound)
+
+	// The code cannot be exchanged a second time.
+	_, err = exchange(newTokenRequest(true))
+	require.Error(t, err)
+}
+
+func TestPKCEPopulateTokenEndpointResponse(t *testing.T) {
+	ctx := context.Background()
+	config := &fosite.Config{}
+	ms := &mockCodeStrategy{signature: "some-signature"}
+
+	t.Run("ignores requests it is not responsible for", func(t *testing.T) {
+		h := &Handler{Storage: storage.NewMemoryStore(), AuthorizeCodeStrategy: ms, Config: config}
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"refresh_token"}
+		require.EqualError(t, h.PopulateTokenEndpointResponse(ctx, r, fosite.NewAccessResponse()), fosite.ErrUnknownRequest.Error())
+	})
+
+	t.Run("deletes the PKCE session after a successful exchange", func(t *testing.T) {
+		store := storage.NewMemoryStore()
+		h := &Handler{Storage: store, AuthorizeCodeStrategy: ms, Config: config}
+		require.NoError(t, store.CreatePKCERequestSession(ctx, "some-signature", fosite.NewAuthorizeRequest()))
+
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"authorization_code"}
+		require.NoError(t, h.PopulateTokenEndpointResponse(ctx, r, fosite.NewAccessResponse()))
+
+		_, err := store.GetPKCERequestSession(ctx, "some-signature", nil)
+		require.ErrorIs(t, err, fosite.ErrNotFound)
+	})
+
+	t.Run("is a no-op when no PKCE session exists (legacy flow)", func(t *testing.T) {
+		h := &Handler{Storage: storage.NewMemoryStore(), AuthorizeCodeStrategy: ms, Config: config}
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"authorization_code"}
+		require.NoError(t, h.PopulateTokenEndpointResponse(ctx, r, fosite.NewAccessResponse()))
+	})
+
+	t.Run("propagates storage failures", func(t *testing.T) {
+		store := &injectableCoreStorage{
+			MemoryStore:                 storage.NewMemoryStore(),
+			deletePKCERequestSessionErr: errors.New("injected storage failure"),
+		}
+		h := &Handler{Storage: store, AuthorizeCodeStrategy: ms, Config: config}
+		r := fosite.NewAccessRequest(&fosite.DefaultSession{})
+		r.GrantTypes = fosite.Arguments{"authorization_code"}
+		require.EqualError(t, h.PopulateTokenEndpointResponse(ctx, r, fosite.NewAccessResponse()), fosite.ErrServerError.Error())
+	})
 }
 
 func newtesterr(err error) error {

@@ -30,6 +30,10 @@ type AuthorizeCodeStorage interface {
 	// InvalidateAuthorizeCodeSession is called when an authorize code is being used. The state of the authorization
 	// code should be set to invalid and consecutive requests to GetAuthorizeCodeSession should return the
 	// ErrInvalidatedAuthorizeCode error.
+	//
+	// This is the claim that makes the authorize code exchange happen exactly once: implementations must return
+	// an error (e.g. fosite.ErrInvalidatedAuthorizeCode) when the code does not exist or has already been
+	// invalidated, so that concurrent exchanges of the same code can succeed at most once.
 	InvalidateAuthorizeCodeSession(ctx context.Context, code string) (err error)
 }
 
