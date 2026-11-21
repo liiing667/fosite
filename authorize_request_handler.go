@@ -297,11 +297,27 @@ func (f *Fosite) authorizeRequestFromPAR(ctx context.Context, r *http.Request, r
 		return false, errorsx.WithStack(ErrServerError.WithHint(ErrorPARNotSupported).WithDebug(DebugPARStorageInvalid))
 	}
 
-	// hydrate the requester
+	// hydrate the requester. When the storage supports atomic consumption,
+	// the PAR session is retrieved and deleted in a single operation so that
+	// the request_uri can never be consumed twice, not even by concurrent
+	// authorization requests.
 	var parRequest AuthorizeRequester
-	var err error
-	if parRequest, err = storage.GetPARSession(ctx, requestURI); err != nil {
-		return false, errorsx.WithStack(ErrInvalidRequestURI.WithHint("Invalid PAR session").WithWrap(err).WithDebug(err.Error()))
+	if consumer, ok := storage.(PARSessionConsumer); ok {
+		var err error
+		if parRequest, err = consumer.ConsumePARSession(ctx, requestURI); err != nil {
+			return false, errorsx.WithStack(ErrInvalidRequestURI.WithHint("Invalid PAR session").WithWrap(err).WithDebug(err.Error()))
+		}
+	} else {
+		// Fallback for storage implementations that have not been upgraded to
+		// the atomic PARSessionConsumer interface yet.
+		var err error
+		if parRequest, err = storage.GetPARSession(ctx, requestURI); err != nil {
+			return false, errorsx.WithStack(ErrInvalidRequestURI.WithHint("Invalid PAR session").WithWrap(err).WithDebug(err.Error()))
+		}
+
+		if err := storage.DeletePARSession(ctx, requestURI); err != nil {
+			return false, errorsx.WithStack(ErrServerError.WithWrap(err).WithDebug(err.Error()))
+		}
 	}
 
 	// hydrate the request object
@@ -310,10 +326,6 @@ func (f *Fosite) authorizeRequestFromPAR(ctx context.Context, r *http.Request, r
 	request.ResponseTypes = parRequest.GetResponseTypes()
 	request.State = parRequest.GetState()
 	request.ResponseMode = parRequest.GetResponseMode()
-
-	if err := storage.DeletePARSession(ctx, requestURI); err != nil {
-		return false, errorsx.WithStack(ErrServerError.WithWrap(err).WithDebug(err.Error()))
-	}
 
 	// validate the clients match
 	if clientID != request.GetClient().GetID() {

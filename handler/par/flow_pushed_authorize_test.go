@@ -5,8 +5,10 @@ package par_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -133,4 +135,114 @@ func TestAuthorizeCode_HandleAuthorizeEndpointRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPushedAuthorizeRequestURIConsumedOnce verifies the whole PAR lifecycle
+// against the memory storage: a stored PAR session can only be consumed once,
+// even when many goroutines try to consume the same request_uri at the same
+// time.
+func TestPushedAuthorizeRequestURIConsumedOnce(t *testing.T) {
+	requestURIPrefix := "urn:ietf:params:oauth:request_uri_diff:"
+	store := storage.NewMemoryStore()
+	handler := PushedAuthorizeHandler{
+		Storage: store,
+		Config: &fosite.Config{
+			PushedAuthorizeContextLifespan:  time.Hour,
+			PushedAuthorizeRequestURIPrefix: requestURIPrefix,
+			ScopeStrategy:                   fosite.HierarchicScopeStrategy,
+			AudienceMatchingStrategy:        fosite.DefaultAudienceMatchingStrategy,
+		},
+	}
+
+	redir := parseURL("https://asdf.de/cb")
+	areq := &fosite.AuthorizeRequest{
+		ResponseTypes: fosite.Arguments{"code"},
+		Request: fosite.Request{
+			Client: &fosite.DefaultClient{
+				ResponseTypes: fosite.Arguments{"code"},
+				RedirectURIs:  []string{"https://asdf.de/cb"},
+				Audience:      []string{"https://www.ory.sh/api"},
+			},
+			RequestedAudience: []string{"https://www.ory.sh/api"},
+			RequestedAt:       time.Now().UTC(),
+			Session:           &fosite.DefaultSession{},
+		},
+		State:       "superstate",
+		RedirectURI: redir,
+	}
+
+	// Push the authorization request.
+	aresp := &fosite.PushedAuthorizeResponse{}
+	require.NoError(t, handler.HandlePushedAuthorizeEndpointRequest(context.Background(), areq, aresp))
+	requestURI := aresp.GetRequestURI()
+	require.NotEmpty(t, requestURI)
+
+	consumer, ok := handler.Storage.(fosite.PARSessionConsumer)
+	require.True(t, ok, "the memory storage must support atomic PAR session consumption")
+
+	const goroutines = 32
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		successes int
+		failures  int
+		otherErrs int
+		start     = make(chan struct{})
+	)
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+
+			_, err := consumer.ConsumePARSession(context.Background(), requestURI)
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, fosite.ErrNotFound):
+				failures++
+			default:
+				otherErrs++
+				assert.NoError(t, err)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, 1, successes)
+	assert.Equal(t, goroutines-1, failures)
+	assert.Equal(t, 0, otherErrs)
+
+	// The request_uri stays unavailable after the concurrent consumption burst.
+	_, err := consumer.ConsumePARSession(context.Background(), requestURI)
+	require.ErrorIs(t, err, fosite.ErrNotFound)
+}
+
+// TestPushedAuthorizeRequestURIExpired verifies that an expired PAR session
+// cannot be consumed.
+func TestPushedAuthorizeRequestURIExpired(t *testing.T) {
+	requestURIPrefix := "urn:ietf:params:oauth:request_uri_diff:"
+	store := storage.NewMemoryStore()
+
+	requestURI := requestURIPrefix + "expired"
+	expired := fosite.NewAuthorizeRequest()
+	expired.Session = &fosite.DefaultSession{
+		ExpiresAt: map[fosite.TokenType]time.Time{
+			fosite.PushedAuthorizeRequestContext: time.Now().UTC().Add(-time.Second),
+		},
+	}
+	require.NoError(t, store.CreatePARSession(context.Background(), requestURI, expired))
+
+	consumer, ok := store.(fosite.PARSessionConsumer)
+	require.True(t, ok)
+
+	got, err := consumer.ConsumePARSession(context.Background(), requestURI)
+	require.ErrorIs(t, err, fosite.ErrNotFound)
+	assert.Nil(t, got)
 }

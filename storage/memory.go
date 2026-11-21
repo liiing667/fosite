@@ -518,6 +518,39 @@ func (s *MemoryStore) DeletePARSession(ctx context.Context, requestURI string) (
 	return nil
 }
 
+// Compile-time assertion that the memory store supports atomic, one-time
+// consumption of pushed authorization request sessions.
+var _ fosite.PARSessionConsumer = (*MemoryStore)(nil)
+
+// ConsumePARSession atomically retrieves and deletes the pushed authorization
+// request context. It guarantees that a request_uri can only be consumed once:
+// concurrent calls are serialized through the session lock and only the first
+// caller receives the session while every subsequent caller gets
+// fosite.ErrNotFound. Expired sessions are treated as if they never existed.
+func (s *MemoryStore) ConsumePARSession(ctx context.Context, requestURI string) (fosite.AuthorizeRequester, error) {
+	s.parSessionsMutex.Lock()
+	defer s.parSessionsMutex.Unlock()
+
+	r, ok := s.PARSessions[requestURI]
+	if !ok {
+		return nil, fosite.ErrNotFound
+	}
+
+	// Expired sessions must not be consumable anymore. Removing them here also
+	// makes sure that an expired request_uri stays unavailable after a restart
+	// once any client attempts to use it.
+	if session := r.GetSession(); session != nil {
+		expiresAt := session.GetExpiresAt(fosite.PushedAuthorizeRequestContext)
+		if !expiresAt.IsZero() && !time.Now().UTC().Before(expiresAt) {
+			delete(s.PARSessions, requestURI)
+			return nil, fosite.ErrNotFound
+		}
+	}
+
+	delete(s.PARSessions, requestURI)
+	return r, nil
+}
+
 func (s *MemoryStore) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
 	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
 	// the Ory Hydra implementation for reference.
