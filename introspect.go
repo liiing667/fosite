@@ -5,6 +5,7 @@ package fosite
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -39,11 +40,17 @@ func AccessTokenFromRequest(req *http.Request) string {
 }
 
 func (f *Fosite) IntrospectToken(ctx context.Context, token string, tokenUse TokenUse, session Session, scopes ...string) (_ TokenUse, _ AccessRequester, err error) {
+	tu, ar, _, err := f.introspectToken(ctx, token, tokenUse, session, scopes...)
+	return tu, ar, err
+}
+
+func (f *Fosite) introspectToken(ctx context.Context, token string, tokenUse TokenUse, session Session, scopes ...string) (_ TokenUse, _ AccessRequester, _ string, err error) {
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/fosite").Start(ctx, "Fosite.IntrospectToken")
 	defer otelx.End(span, &err)
 
 	var found = false
 	var foundTokenUse TokenUse = ""
+	var source string
 
 	ar := NewAccessRequest(session)
 	for _, validator := range f.Config.GetTokenIntrospectionHandlers(ctx) {
@@ -51,17 +58,30 @@ func (f *Fosite) IntrospectToken(ctx context.Context, token string, tokenUse Tok
 		if err == nil {
 			found = true
 			foundTokenUse = tu
+			source = fmt.Sprintf("%T", validator)
 		} else if errors.Is(err, ErrUnknownRequest) {
 			// do nothing
 		} else {
 			rfcerr := ErrorToRFC6749Error(err)
-			return "", nil, errorsx.WithStack(rfcerr)
+			return "", nil, fmt.Sprintf("%T", validator), errorsx.WithStack(rfcerr)
 		}
 	}
 
 	if !found {
-		return "", nil, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find a suitable validation strategy for the token, thus it is invalid."))
+		return "", nil, source, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find a suitable validation strategy for the token, thus it is invalid."))
 	}
 
-	return foundTokenUse, ar, nil
+	if checker, ok := f.Store.(TokenRevocationChecker); ok {
+		revoked, checkErr := checker.IsTokenRevoked(ctx, TokenDigest(token))
+		if checkErr != nil {
+			return "", nil, source, errorsx.WithStack(ErrServerError.WithWrap(checkErr).WithDebug(checkErr.Error()))
+		}
+		if revoked {
+			return "", nil, source, errorsx.WithStack(ErrRequestUnauthorized.
+				WithWrap(ErrInactiveToken).
+				WithHint("The token has been revoked."))
+		}
+	}
+
+	return foundTokenUse, ar, source, nil
 }

@@ -5,6 +5,8 @@ package oauth2
 
 import (
 	"context"
+
+	"github.com/ory/fosite"
 )
 
 // TokenRevocationStorage provides the storage implementation
@@ -29,3 +31,18 @@ type TokenRevocationStorage interface {
 	// token as well.
 	RevokeAccessToken(ctx context.Context, requestID string) error
 }
+
+// Optional token-family extensions. Storage implementations that can revoke
+// an entire access/refresh token family atomically should implement these
+// interfaces in addition to TokenRevocationStorage.
+type TokenFamilyRevoker = fosite.TokenFamilyRevoker
+
+type TokenFamilyRevocationChecker = fosite.TokenFamilyRevocationChecker
+
+type TokenFamilyRevocationStorage = fosite.TokenFamilyRevocationStorage
+
+type TokenFamilyRevocationStateProvider = fosite.TokenFamilyRevocationStateProvider
+
+type TokenFamilyResolver = fosite.TokenFamilyResolver
+
+type TokenFamilyResolution = fosite.TokenFamilyResolution

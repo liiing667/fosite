@@ -102,8 +102,15 @@ func OAuth2TokenIntrospectionFactory(config fosite.Configurator, storage interfa
 // Due to the stateless nature of this factory, THE BUILT-IN REVOCATION MECHANISMS WILL NOT WORK.
 // If you need revocation, you can validate JWTs statefully, using the other factories.
 func OAuth2StatelessJWTIntrospectionFactory(config fosite.Configurator, storage interface{}, strategy interface{}) interface{} {
-	return &oauth2.StatelessJWTValidator{
+	validator := &oauth2.StatelessJWTValidator{
 		Signer: strategy.(jwt.Signer),
 		Config: config,
 	}
+	if checker, ok := storage.(fosite.TokenSignatureRevocationChecker); ok {
+		validator.TokenRevocationChecker = checker
+	}
+	if accessTokenStrategy, ok := strategy.(oauth2.AccessTokenStrategy); ok {
+		validator.AccessTokenStrategy = accessTokenStrategy
+	}
+	return validator
 }

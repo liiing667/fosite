@@ -16,6 +16,11 @@ type StatelessJWTValidator struct {
 	Config interface {
 		fosite.ScopeStrategyProvider
 	}
+	// TokenRevocationChecker and AccessTokenStrategy are optional. When both
+	// are set, a revoked access-token signature is rejected even though the
+	// JWT itself does not require a stored session.
+	TokenRevocationChecker fosite.TokenSignatureRevocationChecker
+	AccessTokenStrategy    AccessTokenStrategy
 }
 
 // AccessTokenJWTToRequest tries to reconstruct fosite.Request from a JWT.
@@ -77,6 +82,19 @@ func (v *StatelessJWTValidator) IntrospectToken(ctx context.Context, token strin
 	// TODO: From here we assume it is an access token, but how do we know it is really and that is not an ID token?
 
 	requester := AccessTokenJWTToRequest(t)
+
+	if v.TokenRevocationChecker != nil && v.AccessTokenStrategy != nil {
+		signature := v.AccessTokenStrategy.AccessTokenSignature(ctx, token)
+		revoked, err := v.TokenRevocationChecker.IsTokenSignatureRevoked(ctx, signature)
+		if err != nil {
+			return "", err
+		}
+		if revoked {
+			return "", fosite.ErrRequestUnauthorized.
+				WithWrap(fosite.ErrInactiveToken).
+				WithHint("The token signature has been revoked.")
+		}
+	}
 
 	if err := matchScopes(v.Config.GetScopeStrategy(ctx), requester.GetGrantedScopes(), scopes); err != nil {
 		return fosite.AccessToken, err

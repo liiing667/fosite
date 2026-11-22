@@ -54,6 +54,41 @@ type MemoryStore struct {
 	// In-memory request ID to token signatures
 	AccessTokenRequestIDs  map[string]string
 	RefreshTokenRequestIDs map[string]string
+	// Token family revocation tombstones. They are keyed by the request ID
+	// shared by an access token and its refresh token chain. Keeping the
+	// tombstone separately from the token sessions makes a partial cleanup
+	// fail closed: even if a token session is still present, every consumer
+	// sees the family as revoked.
+	RevokedTokenFamilies         map[string]fosite.TokenFamilyRevocationRecord
+	TokenFamilyRevocationCounter uint64
+	// Generation maps track the latest access/refresh token generation for a
+	// request family. They are exported so that snapshot/restart
+	// implementations preserve the generation together with the sessions.
+	AccessTokenGenerations            map[string]uint64
+	AccessTokenGenerationCounters     map[string]uint64
+	AccessTokenRevocationGenerations  map[string]uint64
+	RefreshTokenGenerations           map[string]uint64
+	RefreshTokenGenerationCounters    map[string]uint64
+	RefreshTokenRevocationGenerations map[string]uint64
+	// Token signature to request-family indexes. They are intentionally kept
+	// after a token session is rotated out, so revocation can still identify
+	// the family from a token that a concurrent refresh already consumed.
+	AccessTokenFamilies  map[string]string
+	RefreshTokenFamilies map[string]string
+	TokenFamilyClients   map[string]string
+	// TokenRevocations stores durable revocation evidence keyed by the
+	// non-reversible token digest (see fosite.TokenDigest).
+	TokenRevocations map[string]fosite.TokenRevocationRecord
+	// TokenRevocationGeneration is a monotonically increasing sequence for
+	// durable revocation records.
+	TokenRevocationGeneration uint64
+	// RevokedTokenSignatures is the signature-keyed revocation view used by
+	// introspection implementations that do not load token sessions.
+	RevokedTokenSignatures map[string]time.Time
+	// TokenFamilyBySignature maps a revoked token signature back to its
+	// request family, which lets audit consumers correlate evidence after the
+	// token session itself has been deleted.
+	TokenFamilyBySignature map[string]string
 	DeviceCodesRequestIDs  map[string]DeviceAuthPair
 	UserCodesRequestIDs    map[string]string
 	// Public keys to check signature in auth grant jwt assertion.
@@ -74,25 +109,42 @@ type MemoryStore struct {
 	deviceAuthsRequestIDsMutex  sync.RWMutex
 	issuerPublicKeysMutex       sync.RWMutex
 	parSessionsMutex            sync.RWMutex
+	tokenFamiliesMutex          sync.RWMutex
+	tokenGenerationsMutex       sync.RWMutex
+	tokenRevocationsMutex       sync.RWMutex
+	revokedSignaturesMutex      sync.RWMutex
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		Clients:                make(map[string]fosite.Client),
-		AuthorizeCodes:         make(map[string]StoreAuthorizeCode),
-		IDSessions:             make(map[string]fosite.Requester),
-		AccessTokens:           make(map[string]fosite.Requester),
-		RefreshTokens:          make(map[string]StoreRefreshToken),
-		DeviceAuths:            make(map[string]fosite.DeviceRequester),
-		PKCES:                  make(map[string]fosite.Requester),
-		Users:                  make(map[string]MemoryUserRelation),
-		AccessTokenRequestIDs:  make(map[string]string),
-		RefreshTokenRequestIDs: make(map[string]string),
-		DeviceCodesRequestIDs:  make(map[string]DeviceAuthPair),
-		UserCodesRequestIDs:    make(map[string]string),
-		BlacklistedJTIs:        make(map[string]time.Time),
-		IssuerPublicKeys:       make(map[string]IssuerPublicKeys),
-		PARSessions:            make(map[string]fosite.AuthorizeRequester),
+		Clients:                           make(map[string]fosite.Client),
+		AuthorizeCodes:                    make(map[string]StoreAuthorizeCode),
+		IDSessions:                        make(map[string]fosite.Requester),
+		AccessTokens:                      make(map[string]fosite.Requester),
+		RefreshTokens:                     make(map[string]StoreRefreshToken),
+		DeviceAuths:                       make(map[string]fosite.DeviceRequester),
+		PKCES:                             make(map[string]fosite.Requester),
+		Users:                             make(map[string]MemoryUserRelation),
+		AccessTokenRequestIDs:             make(map[string]string),
+		RefreshTokenRequestIDs:            make(map[string]string),
+		RevokedTokenFamilies:              make(map[string]fosite.TokenFamilyRevocationRecord),
+		AccessTokenGenerations:            make(map[string]uint64),
+		AccessTokenGenerationCounters:     make(map[string]uint64),
+		AccessTokenRevocationGenerations:  make(map[string]uint64),
+		RefreshTokenGenerations:           make(map[string]uint64),
+		RefreshTokenGenerationCounters:    make(map[string]uint64),
+		RefreshTokenRevocationGenerations: make(map[string]uint64),
+		AccessTokenFamilies:               make(map[string]string),
+		RefreshTokenFamilies:              make(map[string]string),
+		TokenFamilyClients:                make(map[string]string),
+		TokenRevocations:                  make(map[string]fosite.TokenRevocationRecord),
+		RevokedTokenSignatures:            make(map[string]time.Time),
+		TokenFamilyBySignature:            make(map[string]string),
+		DeviceCodesRequestIDs:             make(map[string]DeviceAuthPair),
+		UserCodesRequestIDs:               make(map[string]string),
+		BlacklistedJTIs:                   make(map[string]time.Time),
+		IssuerPublicKeys:                  make(map[string]IssuerPublicKeys),
+		PARSessions:                       make(map[string]fosite.AuthorizeRequester),
 	}
 }
 
@@ -102,7 +154,11 @@ type StoreAuthorizeCode struct {
 }
 
 type StoreRefreshToken struct {
-	active               bool
+	active bool
+	// Active is the exported mirror of active. It keeps the revocation state
+	// intact when a store is serialized and restored, for example during a
+	// restart.
+	Active               bool `json:"active"`
 	accessTokenSignature string
 	fosite.Requester
 }
@@ -150,19 +206,44 @@ func NewExampleStore() *MemoryStore {
 				Password: "secret",
 			},
 		},
-		AuthorizeCodes:         map[string]StoreAuthorizeCode{},
-		AccessTokens:           map[string]fosite.Requester{},
-		RefreshTokens:          map[string]StoreRefreshToken{},
-		PKCES:                  map[string]fosite.Requester{},
-		DeviceAuths:            make(map[string]fosite.DeviceRequester),
-		AccessTokenRequestIDs:  map[string]string{},
-		RefreshTokenRequestIDs: map[string]string{},
-		DeviceCodesRequestIDs:  make(map[string]DeviceAuthPair),
-		UserCodesRequestIDs:    make(map[string]string),
-		IssuerPublicKeys:       map[string]IssuerPublicKeys{},
-		PARSessions:            map[string]fosite.AuthorizeRequester{},
+		AuthorizeCodes:                    map[string]StoreAuthorizeCode{},
+		AccessTokens:                      map[string]fosite.Requester{},
+		RefreshTokens:                     map[string]StoreRefreshToken{},
+		PKCES:                             map[string]fosite.Requester{},
+		DeviceAuths:                       make(map[string]fosite.DeviceRequester),
+		AccessTokenRequestIDs:             map[string]string{},
+		RefreshTokenRequestIDs:            map[string]string{},
+		RevokedTokenFamilies:              map[string]fosite.TokenFamilyRevocationRecord{},
+		AccessTokenGenerations:            map[string]uint64{},
+		AccessTokenGenerationCounters:     map[string]uint64{},
+		AccessTokenRevocationGenerations:  map[string]uint64{},
+		RefreshTokenGenerations:           map[string]uint64{},
+		RefreshTokenGenerationCounters:    map[string]uint64{},
+		RefreshTokenRevocationGenerations: map[string]uint64{},
+		AccessTokenFamilies:               map[string]string{},
+		RefreshTokenFamilies:              map[string]string{},
+		TokenFamilyClients:                map[string]string{},
+		TokenRevocations:                  map[string]fosite.TokenRevocationRecord{},
+		RevokedTokenSignatures:            map[string]time.Time{},
+		TokenFamilyBySignature:            map[string]string{},
+		DeviceCodesRequestIDs:             make(map[string]DeviceAuthPair),
+		UserCodesRequestIDs:               make(map[string]string),
+		IssuerPublicKeys:                  map[string]IssuerPublicKeys{},
+		PARSessions:                       map[string]fosite.AuthorizeRequester{},
 	}
 }
+
+var (
+	_ fosite.TokenFamilyRevocationStorage       = (*MemoryStore)(nil)
+	_ fosite.TokenFamilyRevocationStateProvider = (*MemoryStore)(nil)
+	_ fosite.TokenFamilyRevocationRecorder      = (*MemoryStore)(nil)
+	_ fosite.TokenFamilyResolver                = (*MemoryStore)(nil)
+	_ fosite.TokenRevocationRecorder            = (*MemoryStore)(nil)
+	_ fosite.TokenRevocationChecker             = (*MemoryStore)(nil)
+	_ fosite.TokenRevocationStateProvider       = (*MemoryStore)(nil)
+	_ fosite.TokenSignatureRevocationRecorder   = (*MemoryStore)(nil)
+	_ fosite.TokenSignatureRevocationChecker    = (*MemoryStore)(nil)
+)
 
 func (s *MemoryStore) CreateOpenIDConnectSession(_ context.Context, authorizeCode string, requester fosite.Requester) error {
 	s.idSessionsMutex.Lock()
@@ -309,39 +390,160 @@ func (s *MemoryStore) DeletePKCERequestSession(_ context.Context, code string) e
 	return nil
 }
 
-func (s *MemoryStore) CreateAccessTokenSession(_ context.Context, signature string, req fosite.Requester) error {
-	// We first lock accessTokenRequestIDsMutex and then accessTokensMutex because this is the same order
-	// locking happens in RevokeAccessToken and using the same order prevents deadlocks.
+func (s *MemoryStore) CreateAccessTokenSession(ctx context.Context, signature string, req fosite.Requester) error {
+	requestID := familyIDOf(req)
+
+	// The family lock is acquired before the token map locks. Every method
+	// that needs the family tombstone and a token map uses this order, which
+	// prevents a revocation from interleaving with token creation.
+	s.tokenFamiliesMutex.RLock()
+	defer s.tokenFamiliesMutex.RUnlock()
+
+	if requestID != "" {
+		if _, revoked := s.RevokedTokenFamilies[requestID]; revoked {
+			return fosite.ErrInactiveToken
+		}
+		s.tokenGenerationsMutex.RLock()
+		accessRevoked := s.AccessTokenRevocationGenerations[requestID] > 0
+		refreshRevoked := s.RefreshTokenRevocationGenerations[requestID] > 0
+		s.tokenGenerationsMutex.RUnlock()
+		if accessRevoked || refreshRevoked {
+			return fosite.ErrInactiveToken
+		}
+		s.accessTokenRequestIDsMutex.RLock()
+		accessMarker, accessExists := s.AccessTokenRequestIDs[requestID]
+		s.accessTokenRequestIDsMutex.RUnlock()
+		s.refreshTokenRequestIDsMutex.RLock()
+		refreshMarker, refreshExists := s.RefreshTokenRequestIDs[requestID]
+		s.refreshTokenRequestIDsMutex.RUnlock()
+		if (accessExists && accessMarker == "") || (refreshExists && refreshMarker == "") {
+			return fosite.ErrInactiveToken
+		}
+	}
+
 	s.accessTokenRequestIDsMutex.Lock()
 	defer s.accessTokenRequestIDsMutex.Unlock()
 	s.accessTokensMutex.Lock()
 	defer s.accessTokensMutex.Unlock()
 
+	if s.AccessTokens == nil {
+		s.AccessTokens = make(map[string]fosite.Requester)
+	}
+	if s.AccessTokenRequestIDs == nil {
+		s.AccessTokenRequestIDs = make(map[string]string)
+	}
+	if marker, exists := s.AccessTokenRequestIDs[requestID]; exists && marker == "" && requestID != "" {
+		return fosite.ErrInactiveToken
+	}
+
+	s.tokenGenerationsMutex.Lock()
+	if s.AccessTokenGenerations == nil {
+		s.AccessTokenGenerations = make(map[string]uint64)
+	}
+	if s.AccessTokenGenerationCounters == nil {
+		s.AccessTokenGenerationCounters = make(map[string]uint64)
+	}
+	if s.AccessTokenRevocationGenerations == nil {
+		s.AccessTokenRevocationGenerations = make(map[string]uint64)
+	}
+	if s.AccessTokenFamilies == nil {
+		s.AccessTokenFamilies = make(map[string]string)
+	}
+	if s.TokenFamilyClients == nil {
+		s.TokenFamilyClients = make(map[string]string)
+	}
+	nextGeneration := s.AccessTokenGenerationCounters[requestID] + 1
+	if revoked := s.AccessTokenRevocationGenerations[requestID]; revoked > 0 {
+		s.tokenGenerationsMutex.Unlock()
+		return fosite.ErrInactiveToken
+	}
+	s.AccessTokenGenerations[signature] = nextGeneration
+	s.AccessTokenGenerationCounters[requestID] = nextGeneration
+	s.AccessTokenFamilies[signature] = requestID
+	if req != nil && req.GetClient() != nil && req.GetClient().GetID() != "" {
+		s.TokenFamilyClients[requestID] = req.GetClient().GetID()
+	}
+	s.tokenGenerationsMutex.Unlock()
+
 	s.AccessTokens[signature] = req
-	s.AccessTokenRequestIDs[req.GetID()] = signature
+	s.AccessTokenRequestIDs[requestID] = signature
 	return nil
 }
 
 func (s *MemoryStore) GetAccessTokenSession(_ context.Context, signature string, _ fosite.Session) (fosite.Requester, error) {
 	s.accessTokensMutex.RLock()
-	defer s.accessTokensMutex.RUnlock()
-
 	rel, ok := s.AccessTokens[signature]
+	s.accessTokensMutex.RUnlock()
 	if !ok {
 		return nil, fosite.ErrNotFound
+	}
+
+	if requestID := familyIDOf(rel); requestID != "" {
+		s.tokenFamiliesMutex.RLock()
+		_, revoked := s.RevokedTokenFamilies[requestID]
+		s.tokenFamiliesMutex.RUnlock()
+		s.tokenGenerationsMutex.RLock()
+		revocationGeneration := s.AccessTokenRevocationGenerations[requestID]
+		generation := s.AccessTokenGenerations[signature]
+		s.tokenGenerationsMutex.RUnlock()
+		if revoked || (revocationGeneration > 0 && generation <= revocationGeneration) {
+			return rel, fosite.ErrInactiveToken
+		}
+		s.accessTokenRequestIDsMutex.RLock()
+		marker, markerExists := s.AccessTokenRequestIDs[requestID]
+		s.accessTokenRequestIDsMutex.RUnlock()
+		if markerExists && marker == "" {
+			return rel, fosite.ErrInactiveToken
+		}
+		s.refreshTokenRequestIDsMutex.RLock()
+		refreshMarker, refreshMarkerExists := s.RefreshTokenRequestIDs[requestID]
+		s.refreshTokenRequestIDsMutex.RUnlock()
+		if refreshMarkerExists && refreshMarker == "" {
+			return rel, fosite.ErrInactiveToken
+		}
 	}
 	return rel, nil
 }
 
 func (s *MemoryStore) DeleteAccessTokenSession(_ context.Context, signature string) error {
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
 	s.accessTokensMutex.Lock()
 	defer s.accessTokensMutex.Unlock()
 
 	delete(s.AccessTokens, signature)
+	for requestID, tokenSignature := range s.AccessTokenRequestIDs {
+		if tokenSignature == signature {
+			delete(s.AccessTokenRequestIDs, requestID)
+		}
+	}
 	return nil
 }
 
-func (s *MemoryStore) CreateRefreshTokenSession(_ context.Context, signature, accessTokenSignature string, req fosite.Requester) error {
+func (s *MemoryStore) CreateRefreshTokenSession(ctx context.Context, signature, accessTokenSignature string, req fosite.Requester) error {
+	requestID := familyIDOf(req)
+
+	s.tokenFamiliesMutex.RLock()
+	defer s.tokenFamiliesMutex.RUnlock()
+
+	if requestID != "" {
+		if _, revoked := s.RevokedTokenFamilies[requestID]; revoked {
+			return fosite.ErrInactiveToken
+		}
+		s.accessTokenRequestIDsMutex.RLock()
+		accessMarker, accessExists := s.AccessTokenRequestIDs[requestID]
+		s.accessTokenRequestIDsMutex.RUnlock()
+		if accessExists && accessMarker == "" {
+			return fosite.ErrInactiveToken
+		}
+		s.refreshTokenRequestIDsMutex.RLock()
+		refreshMarker, refreshExists := s.RefreshTokenRequestIDs[requestID]
+		s.refreshTokenRequestIDsMutex.RUnlock()
+		if refreshExists && refreshMarker == "" {
+			return fosite.ErrInactiveToken
+		}
+	}
+
 	// We first lock refreshTokenRequestIDsMutex and then refreshTokensMutex because this is the same order
 	// locking happens in RevokeRefreshToken and using the same order prevents deadlocks.
 	s.refreshTokenRequestIDsMutex.Lock()
@@ -349,30 +551,114 @@ func (s *MemoryStore) CreateRefreshTokenSession(_ context.Context, signature, ac
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
-	s.RefreshTokens[signature] = StoreRefreshToken{active: true, Requester: req, accessTokenSignature: accessTokenSignature}
-	s.RefreshTokenRequestIDs[req.GetID()] = signature
+	if s.RefreshTokens == nil {
+		s.RefreshTokens = make(map[string]StoreRefreshToken)
+	}
+	if s.RefreshTokenRequestIDs == nil {
+		s.RefreshTokenRequestIDs = make(map[string]string)
+	}
+	if marker, exists := s.RefreshTokenRequestIDs[requestID]; exists && marker == "" && requestID != "" {
+		return fosite.ErrInactiveToken
+	}
+
+	s.tokenGenerationsMutex.Lock()
+	if s.RefreshTokenGenerations == nil {
+		s.RefreshTokenGenerations = make(map[string]uint64)
+	}
+	if s.RefreshTokenGenerationCounters == nil {
+		s.RefreshTokenGenerationCounters = make(map[string]uint64)
+	}
+	if s.RefreshTokenRevocationGenerations == nil {
+		s.RefreshTokenRevocationGenerations = make(map[string]uint64)
+	}
+	if s.RefreshTokenFamilies == nil {
+		s.RefreshTokenFamilies = make(map[string]string)
+	}
+	if s.TokenFamilyClients == nil {
+		s.TokenFamilyClients = make(map[string]string)
+	}
+	nextGeneration := s.RefreshTokenGenerationCounters[requestID] + 1
+	if revoked := s.RefreshTokenRevocationGenerations[requestID]; revoked > 0 {
+		s.tokenGenerationsMutex.Unlock()
+		return fosite.ErrInactiveToken
+	}
+	s.RefreshTokenGenerations[signature] = nextGeneration
+	s.RefreshTokenGenerationCounters[requestID] = nextGeneration
+	s.RefreshTokenFamilies[signature] = requestID
+	if req != nil && req.GetClient() != nil && req.GetClient().GetID() != "" {
+		s.TokenFamilyClients[requestID] = req.GetClient().GetID()
+	}
+	s.tokenGenerationsMutex.Unlock()
+
+	// Keep only one active generation per family. Older generations remain as
+	// inactive tombstones so that re-use is detected as ErrInactiveToken
+	// instead of being mistaken for a malformed token.
+	for previousSignature, previous := range s.RefreshTokens {
+		if previousSignature == signature || previous.Requester == nil {
+			continue
+		}
+		if familyIDOf(previous.Requester) == requestID {
+			previous.active = false
+			previous.Active = false
+			s.RefreshTokens[previousSignature] = previous
+		}
+	}
+
+	s.RefreshTokens[signature] = StoreRefreshToken{active: true, Active: true, Requester: req, accessTokenSignature: accessTokenSignature}
+	s.RefreshTokenRequestIDs[requestID] = signature
 	return nil
 }
 
 func (s *MemoryStore) GetRefreshTokenSession(_ context.Context, signature string, _ fosite.Session) (fosite.Requester, error) {
 	s.refreshTokensMutex.RLock()
-	defer s.refreshTokensMutex.RUnlock()
-
 	rel, ok := s.RefreshTokens[signature]
+	s.refreshTokensMutex.RUnlock()
 	if !ok {
 		return nil, fosite.ErrNotFound
 	}
-	if !rel.active {
+	if !rel.active && !rel.Active {
 		return rel, fosite.ErrInactiveToken
+	}
+
+	if requestID := familyIDOf(rel.Requester); requestID != "" {
+		s.tokenFamiliesMutex.RLock()
+		_, revoked := s.RevokedTokenFamilies[requestID]
+		s.tokenFamiliesMutex.RUnlock()
+		s.tokenGenerationsMutex.RLock()
+		revocationGeneration := s.RefreshTokenRevocationGenerations[requestID]
+		generation := s.RefreshTokenGenerations[signature]
+		s.tokenGenerationsMutex.RUnlock()
+		if revoked || (revocationGeneration > 0 && generation <= revocationGeneration) {
+			return rel, fosite.ErrInactiveToken
+		}
+		s.refreshTokenRequestIDsMutex.RLock()
+		marker, markerExists := s.RefreshTokenRequestIDs[requestID]
+		s.refreshTokenRequestIDsMutex.RUnlock()
+		if markerExists && marker == "" {
+			return rel, fosite.ErrInactiveToken
+		}
+		s.accessTokenRequestIDsMutex.RLock()
+		accessMarker, accessMarkerExists := s.AccessTokenRequestIDs[requestID]
+		s.accessTokenRequestIDsMutex.RUnlock()
+		if accessMarkerExists && accessMarker == "" {
+			return rel, fosite.ErrInactiveToken
+		}
 	}
 	return rel, nil
 }
 
 func (s *MemoryStore) DeleteRefreshTokenSession(_ context.Context, signature string) error {
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
 	delete(s.RefreshTokens, signature)
+	for requestID, tokenSignature := range s.RefreshTokenRequestIDs {
+		if tokenSignature == signature {
+			delete(s.RefreshTokenRequestIDs, requestID)
+		}
+	}
 	return nil
 }
 
@@ -391,6 +677,11 @@ func (s *MemoryStore) Authenticate(_ context.Context, name string, secret string
 }
 
 func (s *MemoryStore) RevokeRefreshToken(ctx context.Context, requestID string) error {
+	revoked := make(map[string]time.Time)
+
+	s.tokenFamiliesMutex.Lock()
+	defer s.tokenFamiliesMutex.Unlock()
+
 	// We first lock refreshTokenRequestIDsMutex and then refreshTokensMutex because this is the same order
 	// locking happens in CreateRefreshTokenSession and using the same order prevents deadlocks.
 	s.refreshTokenRequestIDsMutex.Lock()
@@ -398,27 +689,562 @@ func (s *MemoryStore) RevokeRefreshToken(ctx context.Context, requestID string) 
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
-	if signature, exists := s.RefreshTokenRequestIDs[requestID]; exists {
-		rel, ok := s.RefreshTokens[signature]
-		if !ok {
-			return fosite.ErrNotFound
-		}
-		rel.active = false
-		s.RefreshTokens[signature] = rel
+	if s.RefreshTokens == nil {
+		s.RefreshTokens = make(map[string]StoreRefreshToken)
 	}
+	if s.RefreshTokenRequestIDs == nil {
+		s.RefreshTokenRequestIDs = make(map[string]string)
+	}
+	// Revoke every generation of the family, not only the request ID's most
+	// recent mapping. The mapping may be missing after a restart or a failed
+	// rotation, while an older session is still active.
+	for signature, rel := range s.RefreshTokens {
+		if rel.Requester == nil || familyIDOf(rel.Requester) != requestID {
+			continue
+		}
+		if rel.active || rel.Active {
+			rel.active = false
+			rel.Active = false
+			s.RefreshTokens[signature] = rel
+		}
+		if expiresAt := tokenExpiry(rel.Requester, fosite.RefreshToken); !expiresAt.IsZero() {
+			revoked[signature] = expiresAt
+		}
+	}
+
+	if requestID != "" {
+		s.tokenGenerationsMutex.Lock()
+		if s.RefreshTokenGenerationCounters == nil {
+			s.RefreshTokenGenerationCounters = make(map[string]uint64)
+		}
+		if s.RefreshTokenRevocationGenerations == nil {
+			s.RefreshTokenRevocationGenerations = make(map[string]uint64)
+		}
+		generation := s.RefreshTokenGenerationCounters[requestID]
+		for signature := range revoked {
+			if tokenGeneration := s.RefreshTokenGenerations[signature]; tokenGeneration > generation {
+				generation = tokenGeneration
+			}
+		}
+		if generation == 0 {
+			generation = 1
+		}
+		if generation > s.RefreshTokenRevocationGenerations[requestID] {
+			s.RefreshTokenRevocationGenerations[requestID] = generation
+		}
+		s.tokenGenerationsMutex.Unlock()
+		s.setTokenFamilyRevokedLocked(requestID, fosite.RefreshToken, "", maxExpiry(revoked))
+		s.RefreshTokenRequestIDs[requestID] = ""
+	}
+
+	s.recordRevokedSignatures(ctx, requestID, revoked)
 	return nil
 }
 
 func (s *MemoryStore) RevokeAccessToken(ctx context.Context, requestID string) error {
-	s.accessTokenRequestIDsMutex.RLock()
-	defer s.accessTokenRequestIDsMutex.RUnlock()
+	revoked := make(map[string]time.Time)
 
-	if signature, exists := s.AccessTokenRequestIDs[requestID]; exists {
-		if err := s.DeleteAccessTokenSession(ctx, signature); err != nil {
-			return err
+	s.tokenFamiliesMutex.Lock()
+	defer s.tokenFamiliesMutex.Unlock()
+
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
+	s.accessTokensMutex.Lock()
+	defer s.accessTokensMutex.Unlock()
+
+	if s.AccessTokens == nil {
+		s.AccessTokens = make(map[string]fosite.Requester)
+	}
+	if s.AccessTokenRequestIDs == nil {
+		s.AccessTokenRequestIDs = make(map[string]string)
+	}
+	for signature, rel := range s.AccessTokens {
+		if rel == nil || familyIDOf(rel) != requestID {
+			continue
+		}
+		if expiresAt := tokenExpiry(rel, fosite.AccessToken); !expiresAt.IsZero() {
+			revoked[signature] = expiresAt
+		}
+		delete(s.AccessTokens, signature)
+	}
+	if requestID != "" {
+		s.tokenGenerationsMutex.Lock()
+		if s.AccessTokenGenerationCounters == nil {
+			s.AccessTokenGenerationCounters = make(map[string]uint64)
+		}
+		if s.AccessTokenRevocationGenerations == nil {
+			s.AccessTokenRevocationGenerations = make(map[string]uint64)
+		}
+		generation := s.AccessTokenGenerationCounters[requestID]
+		for signature := range revoked {
+			if tokenGeneration := s.AccessTokenGenerations[signature]; tokenGeneration > generation {
+				generation = tokenGeneration
+			}
+		}
+		if generation == 0 {
+			generation = 1
+		}
+		if generation > s.AccessTokenRevocationGenerations[requestID] {
+			s.AccessTokenRevocationGenerations[requestID] = generation
+		}
+		s.tokenGenerationsMutex.Unlock()
+		s.setTokenFamilyRevokedLocked(requestID, fosite.AccessToken, "", maxExpiry(revoked))
+		s.AccessTokenRequestIDs[requestID] = ""
+	}
+
+	s.recordRevokedSignatures(ctx, requestID, revoked)
+	return nil
+}
+
+// RevokeTokenFamily atomically revokes both the access and refresh tokens of a
+// request family and stores a durable tombstone. Because the tombstone is
+// written under the same family lock as the cleanup, a caller can never
+// observe a family in which only one half was revoked.
+func (s *MemoryStore) RevokeTokenFamily(ctx context.Context, requestID string) error {
+	revoked := make(map[string]time.Time)
+
+	s.tokenFamiliesMutex.Lock()
+	defer s.tokenFamiliesMutex.Unlock()
+
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
+	s.refreshTokensMutex.Lock()
+	defer s.refreshTokensMutex.Unlock()
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
+	s.accessTokensMutex.Lock()
+	defer s.accessTokensMutex.Unlock()
+
+	if s.RefreshTokens == nil {
+		s.RefreshTokens = make(map[string]StoreRefreshToken)
+	}
+	if s.AccessTokens == nil {
+		s.AccessTokens = make(map[string]fosite.Requester)
+	}
+	if s.RefreshTokenRequestIDs == nil {
+		s.RefreshTokenRequestIDs = make(map[string]string)
+	}
+	if s.AccessTokenRequestIDs == nil {
+		s.AccessTokenRequestIDs = make(map[string]string)
+	}
+	for signature, rel := range s.RefreshTokens {
+		if rel.Requester == nil || familyIDOf(rel.Requester) != requestID {
+			continue
+		}
+		rel.active = false
+		rel.Active = false
+		s.RefreshTokens[signature] = rel
+		if expiresAt := tokenExpiry(rel.Requester, fosite.RefreshToken); !expiresAt.IsZero() {
+			revoked[signature] = expiresAt
 		}
 	}
+	for signature, rel := range s.AccessTokens {
+		if rel == nil || familyIDOf(rel) != requestID {
+			continue
+		}
+		if expiresAt := tokenExpiry(rel, fosite.AccessToken); !expiresAt.IsZero() {
+			revoked[signature] = expiresAt
+		}
+		delete(s.AccessTokens, signature)
+	}
+	if requestID != "" {
+		s.tokenGenerationsMutex.Lock()
+		if s.AccessTokenGenerationCounters == nil {
+			s.AccessTokenGenerationCounters = make(map[string]uint64)
+		}
+		if s.AccessTokenRevocationGenerations == nil {
+			s.AccessTokenRevocationGenerations = make(map[string]uint64)
+		}
+		if s.RefreshTokenGenerationCounters == nil {
+			s.RefreshTokenGenerationCounters = make(map[string]uint64)
+		}
+		if s.RefreshTokenRevocationGenerations == nil {
+			s.RefreshTokenRevocationGenerations = make(map[string]uint64)
+		}
+		accessGeneration := s.AccessTokenGenerationCounters[requestID]
+		refreshGeneration := s.RefreshTokenGenerationCounters[requestID]
+		for signature := range revoked {
+			if tokenGeneration := s.AccessTokenGenerations[signature]; tokenGeneration > accessGeneration {
+				accessGeneration = tokenGeneration
+			}
+			if tokenGeneration := s.RefreshTokenGenerations[signature]; tokenGeneration > refreshGeneration {
+				refreshGeneration = tokenGeneration
+			}
+		}
+		if accessGeneration == 0 {
+			accessGeneration = 1
+		}
+		if refreshGeneration == 0 {
+			refreshGeneration = 1
+		}
+		if accessGeneration > s.AccessTokenRevocationGenerations[requestID] {
+			s.AccessTokenRevocationGenerations[requestID] = accessGeneration
+		}
+		if refreshGeneration > s.RefreshTokenRevocationGenerations[requestID] {
+			s.RefreshTokenRevocationGenerations[requestID] = refreshGeneration
+		}
+		s.tokenGenerationsMutex.Unlock()
+		s.setTokenFamilyRevokedLocked(requestID, "", "", maxExpiry(revoked))
+		s.RefreshTokenRequestIDs[requestID] = ""
+		s.AccessTokenRequestIDs[requestID] = ""
+	}
+
+	s.recordRevokedSignatures(ctx, requestID, revoked)
 	return nil
+}
+
+func (s *MemoryStore) IsTokenFamilyRevoked(_ context.Context, requestID string) (bool, error) {
+	if requestID == "" {
+		return false, nil
+	}
+	s.tokenFamiliesMutex.RLock()
+	defer s.tokenFamiliesMutex.RUnlock()
+	if _, revoked := s.RevokedTokenFamilies[requestID]; revoked {
+		return true, nil
+	}
+	s.tokenGenerationsMutex.RLock()
+	accessRevoked := s.AccessTokenRevocationGenerations[requestID] > 0
+	refreshRevoked := s.RefreshTokenRevocationGenerations[requestID] > 0
+	s.tokenGenerationsMutex.RUnlock()
+	if accessRevoked || refreshRevoked {
+		return true, nil
+	}
+
+	// Token maps are also snapshotted by simple restart helpers that do not
+	// know about newer fields. An empty request-ID marker written by a family
+	// revocation carries the same fail-closed decision across such a restart.
+	s.accessTokenRequestIDsMutex.RLock()
+	accessMarker, accessExists := s.AccessTokenRequestIDs[requestID]
+	s.accessTokenRequestIDsMutex.RUnlock()
+	if accessExists && accessMarker == "" {
+		return true, nil
+	}
+	s.refreshTokenRequestIDsMutex.RLock()
+	refreshMarker, refreshExists := s.RefreshTokenRequestIDs[requestID]
+	s.refreshTokenRequestIDsMutex.RUnlock()
+	return refreshExists && refreshMarker == "", nil
+}
+
+func (s *MemoryStore) ResolveTokenFamily(_ context.Context, tokenType fosite.TokenType, signature string) (fosite.TokenFamilyResolution, error) {
+	if signature == "" {
+		return fosite.TokenFamilyResolution{}, fosite.ErrNotFound
+	}
+
+	s.tokenGenerationsMutex.RLock()
+	defer s.tokenGenerationsMutex.RUnlock()
+
+	var requestID string
+	switch tokenType {
+	case fosite.RefreshToken:
+		requestID = s.RefreshTokenFamilies[signature]
+	default:
+		requestID = s.AccessTokenFamilies[signature]
+	}
+	if requestID == "" {
+		return fosite.TokenFamilyResolution{}, fosite.ErrNotFound
+	}
+	return fosite.TokenFamilyResolution{
+		RequestID: requestID,
+		ClientID:  s.TokenFamilyClients[requestID],
+	}, nil
+}
+
+func (s *MemoryStore) GetTokenFamilyRevocation(_ context.Context, requestID string) (fosite.TokenFamilyRevocationRecord, error) {
+	s.tokenFamiliesMutex.RLock()
+	defer s.tokenFamiliesMutex.RUnlock()
+	record, ok := s.RevokedTokenFamilies[requestID]
+	if !ok {
+		return fosite.TokenFamilyRevocationRecord{}, fosite.ErrNotFound
+	}
+	return record, nil
+}
+
+func (s *MemoryStore) RecordTokenFamilyRevocation(_ context.Context, record fosite.TokenFamilyRevocationRecord) error {
+	if record.RequestID == "" {
+		return nil
+	}
+
+	s.tokenFamiliesMutex.Lock()
+	defer s.tokenFamiliesMutex.Unlock()
+
+	if s.RevokedTokenFamilies == nil {
+		s.RevokedTokenFamilies = make(map[string]fosite.TokenFamilyRevocationRecord)
+	}
+	existing, ok := s.RevokedTokenFamilies[record.RequestID]
+	if !ok {
+		s.TokenFamilyRevocationCounter++
+		record.Generation = s.TokenFamilyRevocationCounter
+		if record.RevokedAt.IsZero() {
+			record.RevokedAt = time.Now().UTC()
+		}
+		s.RevokedTokenFamilies[record.RequestID] = record
+		return nil
+	}
+
+	if existing.Source == "" {
+		if record.TokenType != "" {
+			existing.TokenType = record.TokenType
+			existing.TokenUse = record.TokenUse
+		}
+		if record.TokenSignature != "" {
+			existing.TokenSignature = record.TokenSignature
+		}
+		if record.ClientID != "" {
+			existing.ClientID = record.ClientID
+		}
+		if record.Stage != "" {
+			existing.Stage = record.Stage
+		}
+		existing.Source = record.Source
+	}
+	if existing.ExpiresAt.IsZero() || (!record.ExpiresAt.IsZero() && record.ExpiresAt.After(existing.ExpiresAt)) {
+		existing.ExpiresAt = record.ExpiresAt
+	}
+	s.RevokedTokenFamilies[record.RequestID] = existing
+	return nil
+}
+
+// RecordTokenRevocation stores durable revocation evidence for a token digest.
+// Recording the same digest again is idempotent: it preserves the original
+// revocation generation and timestamp so that retries cannot move a revoked
+// token back into an active state.
+func (s *MemoryStore) RecordTokenRevocation(_ context.Context, record fosite.TokenRevocationRecord) error {
+	if record.TokenDigest == "" {
+		return nil
+	}
+
+	s.tokenRevocationsMutex.Lock()
+	defer s.tokenRevocationsMutex.Unlock()
+
+	if s.TokenRevocations == nil {
+		s.TokenRevocations = make(map[string]fosite.TokenRevocationRecord)
+	}
+
+	existing, ok := s.TokenRevocations[record.TokenDigest]
+	if !ok {
+		s.TokenRevocationGeneration++
+		record.Generation = s.TokenRevocationGeneration
+		if record.RevokedAt.IsZero() {
+			record.RevokedAt = time.Now().UTC()
+		}
+		if record.RequestID == "" {
+			record.RequestID = record.RequestFamily
+		}
+		if record.RequestFamily == "" {
+			record.RequestFamily = record.RequestID
+		}
+		if record.TokenType == "" {
+			record.TokenType = record.TokenUse
+		}
+		if record.TokenUse == "" {
+			record.TokenUse = record.TokenType
+		}
+		s.TokenRevocations[record.TokenDigest] = record
+		return nil
+	}
+
+	if existing.TokenSignature == "" {
+		existing.TokenSignature = record.TokenSignature
+	}
+	if existing.ClientID == "" {
+		existing.ClientID = record.ClientID
+	}
+	if existing.TokenUse == "" {
+		existing.TokenUse = record.TokenUse
+	}
+	if existing.TokenType == "" {
+		existing.TokenType = record.TokenType
+	}
+	if existing.RequestID == "" {
+		existing.RequestID = record.RequestID
+	}
+	if existing.RequestFamily == "" {
+		existing.RequestFamily = record.RequestFamily
+	}
+	if existing.Source == "" {
+		existing.Source = record.Source
+	}
+	if existing.Stage == "" {
+		existing.Stage = record.Stage
+	}
+	if existing.ExpiresAt.IsZero() || (!record.ExpiresAt.IsZero() && record.ExpiresAt.After(existing.ExpiresAt)) {
+		existing.ExpiresAt = record.ExpiresAt
+	}
+	if record.RevocationGeneration > existing.RevocationGeneration {
+		existing.RevocationGeneration = record.RevocationGeneration
+	}
+	s.TokenRevocations[record.TokenDigest] = existing
+	return nil
+}
+
+func (s *MemoryStore) GetTokenRevocationState(_ context.Context, tokenDigest string) (fosite.TokenRevocationRecord, error) {
+	s.tokenRevocationsMutex.RLock()
+	defer s.tokenRevocationsMutex.RUnlock()
+	record, ok := s.TokenRevocations[tokenDigest]
+	if !ok {
+		return fosite.TokenRevocationRecord{}, fosite.ErrNotFound
+	}
+	return record, nil
+}
+
+func (s *MemoryStore) IsTokenRevoked(_ context.Context, tokenDigest string) (bool, error) {
+	if tokenDigest == "" {
+		return false, nil
+	}
+
+	s.tokenRevocationsMutex.RLock()
+	record, ok := s.TokenRevocations[tokenDigest]
+	s.tokenRevocationsMutex.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	if !record.ExpiresAt.IsZero() && !time.Now().UTC().Before(record.ExpiresAt) {
+		s.tokenRevocationsMutex.Lock()
+		delete(s.TokenRevocations, tokenDigest)
+		s.tokenRevocationsMutex.Unlock()
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *MemoryStore) RecordTokenSignatureRevocation(_ context.Context, signature string, expiresAt time.Time) error {
+	if signature == "" {
+		return nil
+	}
+
+	s.revokedSignaturesMutex.Lock()
+	defer s.revokedSignaturesMutex.Unlock()
+
+	if s.RevokedTokenSignatures == nil {
+		s.RevokedTokenSignatures = make(map[string]time.Time)
+	}
+	if existing, ok := s.RevokedTokenSignatures[signature]; ok {
+		if existing.IsZero() || expiresAt.IsZero() {
+			s.RevokedTokenSignatures[signature] = time.Time{}
+			return nil
+		}
+		if expiresAt.After(existing) {
+			s.RevokedTokenSignatures[signature] = expiresAt
+		}
+		return nil
+	}
+	s.RevokedTokenSignatures[signature] = expiresAt
+	return nil
+}
+
+func (s *MemoryStore) IsTokenSignatureRevoked(_ context.Context, signature string) (bool, error) {
+	if signature == "" {
+		return false, nil
+	}
+
+	s.revokedSignaturesMutex.RLock()
+	expiresAt, ok := s.RevokedTokenSignatures[signature]
+	s.revokedSignaturesMutex.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	if !expiresAt.IsZero() && !time.Now().UTC().Before(expiresAt) {
+		s.revokedSignaturesMutex.Lock()
+		delete(s.RevokedTokenSignatures, signature)
+		delete(s.TokenFamilyBySignature, signature)
+		s.revokedSignaturesMutex.Unlock()
+		return false, nil
+	}
+	return true, nil
+}
+
+// GetTokenFamilyBySignature returns the request family associated with a
+// revoked token signature. It is used for audit reports when the token session
+// itself is no longer available.
+func (s *MemoryStore) GetTokenFamilyBySignature(_ context.Context, signature string) (string, error) {
+	s.revokedSignaturesMutex.RLock()
+	defer s.revokedSignaturesMutex.RUnlock()
+	requestID, ok := s.TokenFamilyBySignature[signature]
+	if !ok {
+		return "", fosite.ErrNotFound
+	}
+	return requestID, nil
+}
+
+func (s *MemoryStore) setTokenFamilyRevokedLocked(requestID string, tokenType fosite.TokenType, signature string, expiresAt time.Time) {
+	if requestID == "" {
+		return
+	}
+	if s.RevokedTokenFamilies == nil {
+		s.RevokedTokenFamilies = make(map[string]fosite.TokenFamilyRevocationRecord)
+	}
+
+	record, exists := s.RevokedTokenFamilies[requestID]
+	if !exists {
+		s.TokenFamilyRevocationCounter++
+		record = fosite.TokenFamilyRevocationRecord{
+			RequestID:  requestID,
+			RevokedAt:  time.Now().UTC(),
+			Generation: s.TokenFamilyRevocationCounter,
+			Stage:      fosite.TokenStatusStageRevoked,
+		}
+	}
+	if record.TokenType == "" && tokenType != "" {
+		record.TokenType = tokenType
+		record.TokenUse = tokenType
+	}
+	if record.TokenSignature == "" && signature != "" {
+		record.TokenSignature = signature
+	}
+	if record.ExpiresAt.IsZero() || (!expiresAt.IsZero() && expiresAt.After(record.ExpiresAt)) {
+		record.ExpiresAt = expiresAt
+	}
+	if record.Stage == "" {
+		record.Stage = fosite.TokenStatusStageRevoked
+	}
+	s.RevokedTokenFamilies[requestID] = record
+}
+
+func (s *MemoryStore) recordRevokedSignatures(_ context.Context, requestID string, signatures map[string]time.Time) {
+	if len(signatures) == 0 {
+		return
+	}
+
+	s.revokedSignaturesMutex.Lock()
+	defer s.revokedSignaturesMutex.Unlock()
+	if s.RevokedTokenSignatures == nil {
+		s.RevokedTokenSignatures = make(map[string]time.Time)
+	}
+	if s.TokenFamilyBySignature == nil {
+		s.TokenFamilyBySignature = make(map[string]string)
+	}
+	for signature, expiresAt := range signatures {
+		if existing, ok := s.RevokedTokenSignatures[signature]; !ok || existing.IsZero() || expiresAt.IsZero() || expiresAt.After(existing) {
+			s.RevokedTokenSignatures[signature] = expiresAt
+		}
+		if requestID != "" {
+			s.TokenFamilyBySignature[signature] = requestID
+		}
+	}
+}
+
+func familyIDOf(request fosite.Requester) string {
+	if request == nil {
+		return ""
+	}
+	return request.GetID()
+}
+
+func tokenExpiry(request fosite.Requester, tokenType fosite.TokenType) time.Time {
+	if request == nil || request.GetSession() == nil {
+		return time.Time{}
+	}
+	return request.GetSession().GetExpiresAt(tokenType)
+}
+
+func maxExpiry(expiries map[string]time.Time) time.Time {
+	var max time.Time
+	for _, expiresAt := range expiries {
+		if expiresAt.After(max) {
+			max = expiresAt
+		}
+	}
+	return max
 }
 
 func (s *MemoryStore) GetPublicKey(ctx context.Context, issuer string, subject string, keyId string) (*jose.JSONWebKey, error) {
@@ -519,12 +1345,74 @@ func (s *MemoryStore) DeletePARSession(ctx context.Context, requestURI string) (
 }
 
 func (s *MemoryStore) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
-	// the Ory Hydra implementation for reference.
-	if err := s.RevokeRefreshToken(ctx, requestID); err != nil {
-		return err
+	s.tokenFamiliesMutex.RLock()
+	defer s.tokenFamiliesMutex.RUnlock()
+
+	if requestID != "" {
+		if _, revoked := s.RevokedTokenFamilies[requestID]; revoked {
+			return fosite.ErrInactiveToken
+		}
+		s.tokenGenerationsMutex.RLock()
+		accessRevoked := s.AccessTokenRevocationGenerations[requestID] > 0
+		refreshRevoked := s.RefreshTokenRevocationGenerations[requestID] > 0
+		s.tokenGenerationsMutex.RUnlock()
+		if accessRevoked || refreshRevoked {
+			return fosite.ErrInactiveToken
+		}
+		s.accessTokenRequestIDsMutex.RLock()
+		accessMarker, accessExists := s.AccessTokenRequestIDs[requestID]
+		s.accessTokenRequestIDsMutex.RUnlock()
+		s.refreshTokenRequestIDsMutex.RLock()
+		refreshMarker, refreshExists := s.RefreshTokenRequestIDs[requestID]
+		s.refreshTokenRequestIDsMutex.RUnlock()
+		if (accessExists && accessMarker == "") || (refreshExists && refreshMarker == "") {
+			return fosite.ErrInactiveToken
+		}
 	}
-	return s.RevokeAccessToken(ctx, requestID)
+
+	// Lock the refresh token first and the access token second. This is the
+	// same order used by family revocation and avoids deadlocks.
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
+	s.refreshTokensMutex.Lock()
+	defer s.refreshTokensMutex.Unlock()
+
+	if s.RefreshTokens == nil {
+		s.RefreshTokens = make(map[string]StoreRefreshToken)
+	}
+
+	rel, ok := s.RefreshTokens[refreshTokenSignature]
+	if !ok {
+		return fosite.ErrNotFound
+	}
+	if rel.Requester == nil || familyIDOf(rel.Requester) != requestID {
+		return fosite.ErrNotFound
+	}
+	if !rel.active && !rel.Active {
+		return fosite.ErrInactiveToken
+	}
+
+	rel.active = false
+	rel.Active = false
+	s.RefreshTokens[refreshTokenSignature] = rel
+
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
+	s.accessTokensMutex.Lock()
+	defer s.accessTokensMutex.Unlock()
+
+	// Only invalidate the access token that belongs to the presented
+	// generation. A concurrent request may already have created a newer
+	// generation, which must not be touched by this rotation.
+	if rel.accessTokenSignature != "" {
+		delete(s.AccessTokens, rel.accessTokenSignature)
+		if s.AccessTokenRequestIDs[requestID] == rel.accessTokenSignature {
+			delete(s.AccessTokenRequestIDs, requestID)
+		}
+		_ = s.RecordTokenSignatureRevocation(ctx, rel.accessTokenSignature, tokenExpiry(rel.Requester, fosite.AccessToken))
+	}
+
+	return nil
 }
 
 // CreateDeviceAuthSession stores the device auth session

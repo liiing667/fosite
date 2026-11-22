@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/ory/x/errorsx"
 	"github.com/ory/x/otelx"
@@ -33,44 +34,192 @@ import (
 // * https://tools.ietf.org/html/rfc7009#section-2.2
 // An invalid token type hint value is ignored by the authorization
 // server and does not influence the revocation response.
-func (f *Fosite) NewRevocationRequest(ctx context.Context, r *http.Request) (err error) {
+func (f *Fosite) NewRevocationRequest(ctx context.Context, r *http.Request) error {
+	_, err := f.NewRevocationRequestWithReport(ctx, r)
+	return err
+}
+
+// NewRevocationRequestWithReport behaves like NewRevocationRequest but also
+// returns the token family, token type, client and failure stage determined
+// while processing the request. The report is never written to the RFC 7009
+// response and never changes its error code.
+func (f *Fosite) NewRevocationRequestWithReport(ctx context.Context, r *http.Request) (report TokenStatusReport, err error) {
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/fosite").Start(ctx, "Fosite.NewRevocationRequest")
 	defer otelx.End(span, &err)
+	defer func() {
+		if report.TokenDigest == "" {
+			if token := r.PostForm.Get("token"); token != "" {
+				report.TokenDigest = TokenDigest(token)
+			}
+		}
+		if err != nil {
+			report.Active = false
+			report.Revoked = false
+			if report.Stage == "" {
+				report.Stage = TokenStatusStageRevocation
+			}
+			if report.Error == "" {
+				report.Error = err.Error()
+			}
+		}
+		if report.StatusSource == "" {
+			report.StatusSource = report.Source
+		}
+		if report.FailureLocation == "" && report.Stage != "" && report.Stage != TokenStatusStageRevoked && report.Stage != TokenStatusStageActive {
+			report.FailureLocation = report.Stage
+		}
+	}()
 
 	ctx = context.WithValue(ctx, RequestContextKey, r)
 
 	if r.Method != "POST" {
-		return errorsx.WithStack(ErrInvalidRequest.WithHintf("HTTP method is '%s' but expected 'POST'.", r.Method))
+		return report, errorsx.WithStack(ErrInvalidRequest.WithHintf("HTTP method is '%s' but expected 'POST'.", r.Method))
 	} else if err := r.ParseMultipartForm(1 << 20); err != nil && err != http.ErrNotMultipart {
-		return errorsx.WithStack(ErrInvalidRequest.WithHint("Unable to parse HTTP body, make sure to send a properly formatted form request body.").WithWrap(err).WithDebug(err.Error()))
+		return report, errorsx.WithStack(ErrInvalidRequest.WithHint("Unable to parse HTTP body, make sure to send a properly formatted form request body.").WithWrap(err).WithDebug(err.Error()))
 	} else if len(r.PostForm) == 0 {
-		return errorsx.WithStack(ErrInvalidRequest.WithHint("The POST body can not be empty."))
+		return report, errorsx.WithStack(ErrInvalidRequest.WithHint("The POST body can not be empty."))
+	}
+
+	if id, _, ok := r.BasicAuth(); ok {
+		report.ClientID = id
+		if decoded, decodeErr := url.QueryUnescape(id); decodeErr == nil {
+			report.ClientID = decoded
+		}
+	} else if clientID := r.PostForm.Get("client_id"); clientID != "" {
+		report.ClientID = clientID
 	}
 
 	client, err := f.AuthenticateClient(ctx, r, r.PostForm)
 	if err != nil {
-		return err
+		report.Stage = TokenStatusStageAuthentication
+		return report, err
 	}
+	report.ClientID = client.GetID()
 
 	token := r.PostForm.Get("token")
 	tokenTypeHint := TokenType(r.PostForm.Get("token_type_hint"))
+	report.TokenDigest = TokenDigest(token)
+	report.TokenType = tokenTypeHint
+	report.TokenUse = tokenTypeHint
+	report.Stage = TokenStatusStageRevocation
 
 	var found = false
+	var source string
 	for _, loader := range f.Config.GetRevocationHandlers(ctx) {
-		if err := loader.RevokeToken(ctx, token, tokenTypeHint, client); err == nil {
+		var handlerReport TokenStatusReport
+		if withReport, ok := loader.(RevocationHandlerWithReport); ok {
+			handlerReport, err = withReport.RevokeTokenWithReport(ctx, token, tokenTypeHint, client)
+		} else {
+			err = loader.RevokeToken(ctx, token, tokenTypeHint, client)
+		}
+		if err == nil {
 			found = true
+			if source == "" {
+				source = fmt.Sprintf("%T", loader)
+			}
+			mergeRevocationReport(&report, handlerReport)
 		} else if errors.Is(err, ErrUnknownRequest) {
 			// do nothing
 		} else if err != nil {
-			return err
+			mergeRevocationReport(&report, handlerReport)
+			report.Source = fmt.Sprintf("%T", loader)
+			report.Stage = TokenStatusStageRevocation
+			if handlerReport.Error != "" {
+				report.Error = handlerReport.Error
+			}
+			if handlerReport.FailureLocation != "" {
+				report.FailureLocation = handlerReport.FailureLocation
+			}
+			return report, err
 		}
 	}
 
 	if !found {
-		return errorsx.WithStack(ErrInvalidRequest)
+		report.Stage = TokenStatusStageNotFound
+		return report, errorsx.WithStack(ErrInvalidRequest)
 	}
 
-	return nil
+	report.Active = false
+	report.Revoked = true
+	report.Stage = TokenStatusStageRevoked
+	report.Source = source
+	if report.StatusSource == "" {
+		report.StatusSource = source
+	}
+
+	if provider, ok := f.Store.(TokenRevocationStateProvider); ok {
+		if record, recordErr := provider.GetTokenRevocationState(ctx, report.TokenDigest); recordErr == nil {
+			report.Generation = record.Generation
+			report.RevocationGeneration = record.RevocationGeneration
+			report.RevokedAt = record.RevokedAt
+			if report.TokenSignature == "" {
+				report.TokenSignature = record.TokenSignature
+			}
+			if report.TokenType == "" {
+				report.TokenType = record.TokenType
+				report.TokenUse = record.TokenUse
+			}
+			if record.Source != "" {
+				report.StatusSource = record.Source
+			}
+			if report.RequestID == "" {
+				report.RequestID = record.RequestID
+				report.RequestFamily = record.RequestFamily
+			}
+		}
+	}
+
+	if report.RequestFamily == "" {
+		report.RequestFamily = report.RequestID
+	}
+	return report, nil
+}
+
+func mergeRevocationReport(dst *TokenStatusReport, src TokenStatusReport) {
+	if src.TokenSignature != "" {
+		dst.TokenSignature = src.TokenSignature
+	}
+	if src.ClientID != "" {
+		dst.ClientID = src.ClientID
+	}
+	if src.TokenUse != "" {
+		dst.TokenUse = src.TokenUse
+	}
+	if src.TokenType != "" {
+		dst.TokenType = src.TokenType
+	}
+	if src.RequestID != "" {
+		dst.RequestID = src.RequestID
+	}
+	if src.RequestFamily != "" {
+		dst.RequestFamily = src.RequestFamily
+	}
+	if src.Source != "" {
+		dst.Source = src.Source
+	}
+	if src.StatusSource != "" {
+		dst.StatusSource = src.StatusSource
+	}
+	if src.Stage != "" {
+		dst.Stage = src.Stage
+	}
+	if src.FailureLocation != "" {
+		dst.FailureLocation = src.FailureLocation
+	}
+	if src.Error != "" {
+		dst.Error = src.Error
+	}
+	if src.Generation > dst.Generation {
+		dst.Generation = src.Generation
+	}
+	if src.RevocationGeneration > dst.RevocationGeneration {
+		dst.RevocationGeneration = src.RevocationGeneration
+	}
+	if !src.RevokedAt.IsZero() {
+		dst.RevokedAt = src.RevokedAt
+	}
+	dst.Active = dst.Active || src.Active
+	dst.Revoked = dst.Revoked || src.Revoked
 }
 
 // WriteRevocationResponse writes a token revocation response as specified in:
