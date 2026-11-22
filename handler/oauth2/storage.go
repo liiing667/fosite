@@ -48,5 +48,18 @@ type RefreshTokenStorage interface {
 
 	DeleteRefreshTokenSession(ctx context.Context, signature string) (err error)
 
+	// RotateRefreshToken invalidates the refresh token identified by
+	// `refreshTokenSignature` - the generation that was presented by the client -
+	// together with the access token that was issued alongside it, before a new
+	// generation is created with `CreateRefreshTokenSession`.
+	//
+	// Implementations should pin the rotation to the token family (`requestID`)
+	// and the presented generation (`refreshTokenSignature`): if the presented
+	// token is unknown, belongs to a different family, or was already rotated,
+	// an error (e.g. fosite.ErrNotFound or fosite.ErrInactiveToken) should be
+	// returned and no other token of the family should be touched. This
+	// guarantees that a refresh token family keeps exactly one valid generation
+	// at any time, even under concurrent use, after a failed rotation, or after
+	// a restart.
 	RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error)
 }

@@ -62,6 +62,16 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 		return fosite.ErrServerError.WithWrap(err).WithDebug(err.Error())
 	}
 
+	// Pin the token family, the client, and the generation (the signature of the
+	// presented refresh token) of this refresh request as candidates. All
+	// subsequent steps - including the token rotation in
+	// PopulateTokenEndpointResponse - operate on exactly these pinned values, so
+	// that the refresh token family keeps exactly one valid generation, even when
+	// a rotation fails halfway through, tokens are used concurrently, or the
+	// server was restarted in between.
+	pinnedTokenFamily := originalRequest.GetID()
+	pinnedClientID := originalRequest.GetClient().GetID()
+
 	if err := c.RefreshTokenStrategy.ValidateRefreshToken(ctx, originalRequest, refresh); err != nil {
 		// The authorization server MUST ... validate the refresh token.
 		// This needs to happen after store retrieval for the session to be hydrated properly
@@ -79,11 +89,11 @@ func (c *RefreshTokenGrantHandler) HandleTokenEndpointRequest(ctx context.Contex
 	}
 
 	// The authorization server MUST ... and ensure that the refresh token was issued to the authenticated client
-	if originalRequest.GetClient().GetID() != request.GetClient().GetID() {
+	if pinnedClientID != request.GetClient().GetID() {
 		return errorsx.WithStack(fosite.ErrInvalidGrant.WithHint("The OAuth 2.0 Client ID from this request does not match the ID during the initial token issuance."))
 	}
 
-	request.SetID(originalRequest.GetID())
+	request.SetID(pinnedTokenFamily)
 	request.SetSession(originalRequest.GetSession().Clone())
 	request.SetRequestedScopes(originalRequest.GetRequestedScopes())
 	request.SetRequestedAudience(originalRequest.GetRequestedAudience())
@@ -140,6 +150,12 @@ func (c *RefreshTokenGrantHandler) PopulateTokenEndpointResponse(ctx context.Con
 	storeReq := requester.Sanitize([]string{})
 	storeReq.SetID(requester.GetID())
 
+	// Rotate out exactly the pinned generation (signature) of the pinned token
+	// family (requester.GetID()) that was determined in
+	// HandleTokenEndpointRequest. If the presented generation was already
+	// rotated - e.g. by a concurrent request - the storage returns an error and
+	// no new tokens are issued, leaving the family with exactly one valid
+	// generation.
 	if err = c.TokenRevocationStorage.RotateRefreshToken(ctx, requester.GetID(), signature); err != nil {
 		return c.handleRefreshTokenEndpointStorageError(ctx, err)
 	}
@@ -184,15 +200,29 @@ func (c *RefreshTokenGrantHandler) handleRefreshTokenReuse(ctx context.Context, 
 		err = c.handleRefreshTokenEndpointStorageError(ctx, err)
 	}()
 
-	if err = c.TokenRevocationStorage.DeleteRefreshTokenSession(ctx, signature); err != nil {
-		return err
-	} else if err = c.TokenRevocationStorage.RevokeRefreshToken(
-		ctx, req.GetID(),
-	); err != nil && !errors.Is(err, fosite.ErrNotFound) {
-		return err
-	} else if err = c.TokenRevocationStorage.RevokeAccessToken(
-		ctx, req.GetID(),
-	); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+	// The whole token family is revoked best-effort: a storage error in one of
+	// the calls must not abort the revocation halfway through and keep the
+	// remaining - possibly stolen - tokens of the family alive. The first
+	// unexpected error is returned (and rolled back) after all calls were
+	// attempted.
+	var revocationErr error
+	tryRevoke := func(revoke func(ctx context.Context) error) {
+		if revokeErr := revoke(ctx); revokeErr != nil && !errors.Is(revokeErr, fosite.ErrNotFound) && revocationErr == nil {
+			revocationErr = revokeErr
+		}
+	}
+
+	tryRevoke(func(ctx context.Context) error {
+		return c.TokenRevocationStorage.DeleteRefreshTokenSession(ctx, signature)
+	})
+	tryRevoke(func(ctx context.Context) error {
+		return c.TokenRevocationStorage.RevokeRefreshToken(ctx, req.GetID())
+	})
+	tryRevoke(func(ctx context.Context) error {
+		return c.TokenRevocationStorage.RevokeAccessToken(ctx, req.GetID())
+	})
+
+	if err = revocationErr; err != nil {
 		return err
 	}
 

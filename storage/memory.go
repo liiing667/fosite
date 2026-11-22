@@ -518,13 +518,55 @@ func (s *MemoryStore) DeletePARSession(ctx context.Context, requestURI string) (
 	return nil
 }
 
-func (s *MemoryStore) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
-	// the Ory Hydra implementation for reference.
-	if err := s.RevokeRefreshToken(ctx, requestID); err != nil {
-		return err
+func (s *MemoryStore) RotateRefreshToken(_ context.Context, requestID string, refreshTokenSignature string) (err error) {
+	// We first lock refreshTokenRequestIDsMutex and then refreshTokensMutex because this is the same order
+	// locking happens in CreateRefreshTokenSession and RevokeRefreshToken and using the same order prevents deadlocks.
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
+	s.refreshTokensMutex.Lock()
+	defer s.refreshTokensMutex.Unlock()
+
+	// The rotation is pinned to the token family (requestID) and the exact token
+	// generation (refreshTokenSignature) that was presented by the client. Only
+	// that generation is invalidated - never a newer one that a concurrent request
+	// may have issued in the meantime - so that a refresh token family has exactly
+	// one valid generation at any time. This holds even when requests race, when a
+	// previous rotation attempt failed halfway through, or when the request ID to
+	// signature mapping was lost (e.g. after a restart).
+	rel, ok := s.RefreshTokens[refreshTokenSignature]
+	if !ok {
+		return fosite.ErrNotFound
 	}
-	return s.RevokeAccessToken(ctx, requestID)
+	if rel.Requester == nil || rel.Requester.GetID() != requestID {
+		// The presented token does not belong to this token family.
+		return fosite.ErrNotFound
+	}
+	if !rel.active {
+		// The presented generation was already rotated out. This indicates a
+		// replayed refresh token or two concurrent requests using the same token.
+		return fosite.ErrInactiveToken
+	}
+
+	rel.active = false
+	s.RefreshTokens[refreshTokenSignature] = rel
+
+	// Revoke the access token that was issued together with the presented
+	// generation. Locking happens in the same order as in CreateAccessTokenSession
+	// and RevokeAccessToken and using the same order prevents deadlocks.
+	s.accessTokenRequestIDsMutex.Lock()
+	defer s.accessTokenRequestIDsMutex.Unlock()
+	s.accessTokensMutex.Lock()
+	defer s.accessTokensMutex.Unlock()
+
+	if len(rel.accessTokenSignature) > 0 {
+		delete(s.AccessTokens, rel.accessTokenSignature)
+	}
+	if accessTokenSignature, ok := s.AccessTokenRequestIDs[requestID]; ok {
+		delete(s.AccessTokens, accessTokenSignature)
+		delete(s.AccessTokenRequestIDs, requestID)
+	}
+
+	return nil
 }
 
 // CreateDeviceAuthSession stores the device auth session
