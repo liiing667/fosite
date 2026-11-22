@@ -20,6 +20,12 @@ type RFC8628CoreStorage interface {
 // DeviceAuthStorage handles the device auth session storage
 type DeviceAuthStorage interface {
 	// CreateDeviceAuthSession stores the device auth request session.
+	//
+	// The user code identifies exactly one device authorization session. If a
+	// session with the same user code signature already exists, this method
+	// must return the fosite.ErrExistingUserCodeSignature error, so that a new
+	// user code can be generated. It must never silently re-bind a user code
+	// to another session, device or client.
 	CreateDeviceAuthSession(ctx context.Context, deviceCodeSignature, userCodeSignature string, request fosite.DeviceRequester) (err error)
 
 	// GetDeviceCodeSession hydrates the session based on the given device code and returns the device request.

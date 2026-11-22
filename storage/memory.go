@@ -74,6 +74,12 @@ type MemoryStore struct {
 	deviceAuthsRequestIDsMutex  sync.RWMutex
 	issuerPublicKeysMutex       sync.RWMutex
 	parSessionsMutex            sync.RWMutex
+
+	// deviceAuthsInvalidated holds device authorization sessions whose device
+	// code has already been used. It is keyed by both the device code and the
+	// user code signature, so that a replayed code still resolves to the
+	// session (and thus the device and client) it was issued for.
+	deviceAuthsInvalidated map[string]fosite.DeviceRequester
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -93,6 +99,8 @@ func NewMemoryStore() *MemoryStore {
 		BlacklistedJTIs:        make(map[string]time.Time),
 		IssuerPublicKeys:       make(map[string]IssuerPublicKeys),
 		PARSessions:            make(map[string]fosite.AuthorizeRequester),
+
+		deviceAuthsInvalidated: make(map[string]fosite.DeviceRequester),
 	}
 }
 
@@ -161,6 +169,8 @@ func NewExampleStore() *MemoryStore {
 		UserCodesRequestIDs:    make(map[string]string),
 		IssuerPublicKeys:       map[string]IssuerPublicKeys{},
 		PARSessions:            map[string]fosite.AuthorizeRequester{},
+
+		deviceAuthsInvalidated: make(map[string]fosite.DeviceRequester),
 	}
 }
 
@@ -534,6 +544,27 @@ func (s *MemoryStore) CreateDeviceAuthSession(_ context.Context, deviceCodeSigna
 	s.deviceAuthsMutex.Lock()
 	defer s.deviceAuthsMutex.Unlock()
 
+	// A user code identifies exactly one device authorization session. If the
+	// user code is already known - even if the session it was issued for has
+	// already been used - the new session must be rejected. Otherwise the user
+	// code would silently be re-bound to a different device and client.
+	if _, ok := s.DeviceAuths[userCodeSignature]; ok {
+		return fosite.ErrExistingUserCodeSignature
+	}
+	if _, ok := s.deviceAuthsInvalidated[userCodeSignature]; ok {
+		return fosite.ErrExistingUserCodeSignature
+	}
+
+	// Device codes have plenty of entropy, so a collision should never happen.
+	// If one does occur, fail loudly instead of silently overwriting the
+	// existing session and mixing up the identities of the two flows.
+	if _, ok := s.DeviceAuths[deviceCodeSignature]; ok {
+		return errors.New("device code signature already exists")
+	}
+	if _, ok := s.deviceAuthsInvalidated[deviceCodeSignature]; ok {
+		return errors.New("device code signature already exists")
+	}
+
 	s.DeviceAuths[deviceCodeSignature] = req
 	s.DeviceAuths[userCodeSignature] = req
 	s.DeviceCodesRequestIDs[req.GetID()] = DeviceAuthPair{d: deviceCodeSignature, u: userCodeSignature}
@@ -545,18 +576,51 @@ func (s *MemoryStore) GetDeviceCodeSession(_ context.Context, signature string, 
 	s.deviceAuthsMutex.RLock()
 	defer s.deviceAuthsMutex.RUnlock()
 
-	rel, ok := s.DeviceAuths[signature]
-	if !ok {
-		return nil, fosite.ErrNotFound
+	if rel, ok := s.DeviceAuths[signature]; ok {
+		return rel, nil
 	}
-	return rel, nil
+
+	// Sessions of already used device codes are kept around, so that the
+	// replay of a device code can be detected and the tokens that were issued
+	// for it can be revoked.
+	if rel, ok := s.deviceAuthsInvalidated[signature]; ok {
+		return rel, fosite.ErrInvalidatedDeviceCode
+	}
+
+	return nil, fosite.ErrNotFound
 }
 
 // InvalidateDeviceCodeSession invalidates the device code session
 func (s *MemoryStore) InvalidateDeviceCodeSession(_ context.Context, code string) error {
+	s.deviceAuthsRequestIDsMutex.Lock()
+	defer s.deviceAuthsRequestIDsMutex.Unlock()
 	s.deviceAuthsMutex.Lock()
 	defer s.deviceAuthsMutex.Unlock()
 
-	delete(s.DeviceAuths, code)
+	req, ok := s.DeviceAuths[code]
+	if !ok {
+		return nil
+	}
+
+	if s.deviceAuthsInvalidated == nil {
+		s.deviceAuthsInvalidated = make(map[string]fosite.DeviceRequester)
+	}
+
+	// The device code and the user code belong to the same device
+	// authorization session and must be invalidated together, so that neither
+	// of them can be used to look up the session - and the device and client
+	// it belongs to - as an active session after it has been used.
+	signatures := []string{code}
+	if pair, ok := s.DeviceCodesRequestIDs[req.GetID()]; ok {
+		signatures = append(signatures, pair.d, pair.u)
+		delete(s.DeviceCodesRequestIDs, req.GetID())
+	}
+
+	for _, signature := range signatures {
+		if rel, ok := s.DeviceAuths[signature]; ok {
+			s.deviceAuthsInvalidated[signature] = rel
+			delete(s.DeviceAuths, signature)
+		}
+	}
 	return nil
 }

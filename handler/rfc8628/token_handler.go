@@ -157,7 +157,9 @@ func (c *DeviceCodeTokenEndpointHandler) HandleTokenEndpointRequest(ctx context.
 	var ar fosite.DeviceRequester
 	if ar, err = c.session(ctx, requester, signature); err != nil {
 		if ar != nil && (errors.Is(err, fosite.ErrInvalidatedAuthorizeCode) || errors.Is(err, fosite.ErrInvalidatedDeviceCode)) {
-			return c.revokeTokens(ctx, requester.GetID())
+			// If a device code is used twice, we revoke all refresh and access
+			// tokens associated with the original device authorization request.
+			return c.revokeTokens(ctx, ar.GetID())
 		}
 
 		return err
