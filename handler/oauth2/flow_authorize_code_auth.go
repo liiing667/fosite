@@ -77,6 +77,12 @@ func (c *AuthorizeExplicitGrantHandler) HandleAuthorizeEndpointRequest(ctx conte
 }
 
 func (c *AuthorizeExplicitGrantHandler) IssueAuthorizeCode(ctx context.Context, ar fosite.AuthorizeRequester, resp fosite.AuthorizeResponder) error {
+	// Freeze the client registration revision, redirect URI, scopes and the
+	// recovery generation before the code is persisted. The same values are
+	// carried into the token session so that retries cannot switch client
+	// versions or generations.
+	fosite.PrepareAuthorizeCodeRequest(ar)
+
 	code, signature, err := c.AuthorizeCodeStrategy.GenerateAuthorizeCode(ctx, ar)
 	if err != nil {
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))

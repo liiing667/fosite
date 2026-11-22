@@ -70,12 +70,15 @@ func (c *CoreValidator) introspectAccessToken(ctx context.Context, token string,
 	sig := c.CoreStrategy.AccessTokenSignature(ctx, token)
 	or, err := c.CoreStorage.GetAccessTokenSession(ctx, sig, accessRequest.GetSession())
 	if err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return errorsx.WithStack(fosite.ErrRequestUnauthorized.WithWrap(err).WithDebug(err.Error()))
 	} else if err := c.CoreStrategy.ValidateAccessToken(ctx, or, token); err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return err
 	}
 
 	if err := matchScopes(c.Config.GetScopeStrategy(ctx), or.GetGrantedScopes(), scopes); err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return err
 	}
 
@@ -88,12 +91,15 @@ func (c *CoreValidator) introspectRefreshToken(ctx context.Context, token string
 	or, err := c.CoreStorage.GetRefreshTokenSession(ctx, sig, accessRequest.GetSession())
 
 	if err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return errorsx.WithStack(fosite.ErrRequestUnauthorized.WithWrap(err).WithDebug(err.Error()))
 	} else if err := c.CoreStrategy.ValidateRefreshToken(ctx, or, token); err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return err
 	}
 
 	if err := matchScopes(c.Config.GetScopeStrategy(ctx), or.GetGrantedScopes(), scopes); err != nil {
+		fosite.SetRequesterRejectionStage(accessRequest, fosite.RecoveryStageIntrospection)
 		return err
 	}
 

@@ -44,7 +44,7 @@ func AccessTokenJWTToRequest(token *jwt.Token) fosite.Requester {
 		}
 	}
 
-	return &fosite.Request{
+	request := &fosite.Request{
 		RequestedAt: requestedAt,
 		Client: &fosite.DefaultClient{
 			ID: clientId,
@@ -66,6 +66,62 @@ func AccessTokenJWTToRequest(token *jwt.Token) fosite.Requester {
 		RequestedAudience: claims.Audience,
 		GrantedAudience:   claims.Audience,
 	}
+
+	if revision := jwtStringClaim(mapClaims, "client_revision", "client_version", "client_authentication_version"); revision != "" {
+		request.SetClientRevision(revision)
+	}
+	if generation := jwtUint64Claim(mapClaims, "client_generation"); generation != 0 {
+		request.SetClientGeneration(generation)
+	}
+	if generation := jwtUint64Claim(mapClaims, "recovery_generation", "generation", "authorization_generation"); generation != 0 {
+		request.SetRecoveryGeneration(generation)
+	}
+	if status := jwtStringClaim(mapClaims, "authorization_code_status", "code_status"); status != "" {
+		request.SetAuthorizeCodeStatus(status)
+	} else if consumed, ok := mapClaims["code_consumed"].(bool); ok && consumed {
+		request.SetAuthorizeCodeStatus(fosite.AuthorizeCodeStatusConsumed)
+	}
+	if stage := jwtStringClaim(mapClaims, "rejection_stage", "failure_stage"); stage != "" {
+		request.SetRejectionStage(stage)
+	}
+	if stage := jwtStringClaim(mapClaims, "recovery_stage", "authorize_code_stage"); stage != "" {
+		request.SetAuthorizeCodeStage(stage)
+	}
+
+	return request
+}
+
+func jwtStringClaim(claims jwt.MapClaims, names ...string) string {
+	for _, name := range names {
+		if value, ok := claims[name].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func jwtUint64Claim(claims jwt.MapClaims, names ...string) uint64 {
+	for _, name := range names {
+		switch value := claims[name].(type) {
+		case float64:
+			if value > 0 {
+				return uint64(value)
+			}
+		case int64:
+			if value > 0 {
+				return uint64(value)
+			}
+		case int:
+			if value > 0 {
+				return uint64(value)
+			}
+		case uint64:
+			if value > 0 {
+				return value
+			}
+		}
+	}
+	return 0
 }
 
 func (v *StatelessJWTValidator) IntrospectToken(ctx context.Context, token string, tokenUse fosite.TokenUse, accessRequest fosite.AccessRequester, scopes []string) (fosite.TokenUse, error) {

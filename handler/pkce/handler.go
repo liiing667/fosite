@@ -146,10 +146,6 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 	}
 
-	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil {
-		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
-	}
-
 	challenge := pkceRequest.GetRequestForm().Get("code_challenge")
 	method := pkceRequest.GetRequestForm().Get("code_challenge_method")
 	client := pkceRequest.GetClient()
@@ -230,6 +226,19 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 }
 
 func (c *Handler) PopulateTokenEndpointResponse(ctx context.Context, requester fosite.AccessRequester, responder fosite.AccessResponder) error {
+	if !c.CanHandleTokenEndpointRequest(ctx, requester) {
+		return errorsx.WithStack(fosite.ErrUnknownRequest)
+	}
+
+	// The PKCE binding is consumed only after the authorization code has been
+	// exchanged successfully. Keeping it until then lets a legitimate retry
+	// prove possession of the verifier when token creation failed before the
+	// code was claimed.
+	signature := c.AuthorizeCodeStrategy.AuthorizeCodeSignature(ctx, requester.GetRequestForm().Get("code"))
+	if err := c.Storage.DeletePKCERequestSession(ctx, signature); err != nil && !errors.Is(err, fosite.ErrNotFound) {
+		return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
+	}
+
 	return nil
 }
 

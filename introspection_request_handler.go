@@ -151,7 +151,11 @@ func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, s
 
 	tu, ar, err := f.IntrospectToken(ctx, token, TokenUse(tokenTypeHint), session, RemoveEmpty(strings.Split(scope, " "))...)
 	if err != nil {
-		return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrInactiveToken.WithHint("An introspection strategy indicated that the token is inactive.").WithWrap(err).WithDebug(err.Error()))
+		return &IntrospectionResponse{
+			Active:         false,
+			RejectionStage: RecoveryStageIntrospection,
+			FailureStage:   RecoveryStageIntrospection,
+		}, errorsx.WithStack(ErrInactiveToken.WithHint("An introspection strategy indicated that the token is inactive.").WithWrap(err).WithDebug(err.Error()))
 	}
 	accessTokenType := ""
 
@@ -159,12 +163,14 @@ func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, s
 		accessTokenType = BearerAccessToken
 	}
 
-	return &IntrospectionResponse{
+	response := &IntrospectionResponse{
 		Active:          true,
 		AccessRequester: ar,
 		TokenUse:        tu,
 		AccessTokenType: accessTokenType,
-	}, nil
+	}
+	response.populateRecoveryMetadata(ar)
+	return response, nil
 }
 
 type IntrospectionResponse struct {
@@ -173,6 +179,48 @@ type IntrospectionResponse struct {
 	TokenUse        TokenUse        `json:"token_use,omitempty"`
 	AccessTokenType string          `json:"token_type,omitempty"`
 	Lang            language.Tag    `json:"-"`
+
+	// Recovery metadata is exposed as top-level RFC 7662 extension fields.
+	// The aliases are intentional: consumers of the token endpoint response,
+	// JSON introspection and the Go API use different vocabulary.
+	ClientVersion               string `json:"client_version,omitempty"`
+	ClientRevision              string `json:"client_revision,omitempty"`
+	ClientAuthVersion           string `json:"client_authentication_version,omitempty"`
+	ClientAuthenticationVersion string `json:"-"`
+	ClientGeneration            uint64 `json:"client_generation,omitempty"`
+	RecoveryGeneration          uint64 `json:"recovery_generation,omitempty"`
+	Generation                  uint64 `json:"generation,omitempty"`
+	AuthorizationCodeStatus     string `json:"authorization_code_status,omitempty"`
+	CodeStatus                  string `json:"code_status,omitempty"`
+	AuthorizationCodeUsed       bool   `json:"authorization_code_consumed,omitempty"`
+	CodeUsed                    bool   `json:"code_consumed,omitempty"`
+	AuthorizationCodeConsumed   bool   `json:"-"`
+	CodeConsumed                bool   `json:"-"`
+	RejectionStage              string `json:"rejection_stage,omitempty"`
+	FailureStage                string `json:"failure_stage,omitempty"`
+	RecoveryStage               string `json:"recovery_stage,omitempty"`
+}
+
+func (r *IntrospectionResponse) populateRecoveryMetadata(requester Requester) {
+	if r == nil || requester == nil {
+		return
+	}
+	r.ClientRevision = RequesterClientRevision(requester)
+	r.ClientVersion = r.ClientRevision
+	r.ClientAuthVersion = r.ClientRevision
+	r.ClientAuthenticationVersion = r.ClientRevision
+	r.ClientGeneration = RequesterClientGeneration(requester)
+	r.RecoveryGeneration = RequesterRecoveryGeneration(requester)
+	r.Generation = r.RecoveryGeneration
+	r.AuthorizationCodeStatus = RequesterAuthorizeCodeStatus(requester)
+	r.CodeStatus = r.AuthorizationCodeStatus
+	r.AuthorizationCodeUsed = r.AuthorizationCodeStatus == AuthorizeCodeStatusConsumed
+	r.CodeUsed = r.AuthorizationCodeUsed
+	r.AuthorizationCodeConsumed = r.AuthorizationCodeUsed
+	r.CodeConsumed = r.AuthorizationCodeUsed
+	r.RejectionStage = RequesterRejectionStage(requester)
+	r.FailureStage = r.RejectionStage
+	r.RecoveryStage = RequesterAuthorizeCodeStage(requester)
 }
 
 func (r *IntrospectionResponse) IsActive() bool {
@@ -189,4 +237,97 @@ func (r *IntrospectionResponse) GetTokenUse() TokenUse {
 
 func (r *IntrospectionResponse) GetAccessTokenType() string {
 	return r.AccessTokenType
+}
+
+// GetClientVersion returns the client registration revision stored with the
+// introspected token.
+func (r *IntrospectionResponse) GetClientVersion() string {
+	if r == nil {
+		return ""
+	}
+	return r.ClientVersion
+}
+
+// GetClientRevision returns the client registration revision stored with the
+// introspected token.
+func (r *IntrospectionResponse) GetClientRevision() string {
+	if r == nil {
+		return ""
+	}
+	return r.ClientRevision
+}
+
+// GetClientGeneration returns the numeric client registration generation.
+func (r *IntrospectionResponse) GetClientGeneration() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.ClientGeneration
+}
+
+// GetClientAuthenticationVersion returns the client authentication revision.
+func (r *IntrospectionResponse) GetClientAuthenticationVersion() string {
+	if r == nil {
+		return ""
+	}
+	if r.ClientAuthenticationVersion != "" {
+		return r.ClientAuthenticationVersion
+	}
+	return r.ClientAuthVersion
+}
+
+// GetRecoveryGeneration returns the authorization-code recovery generation.
+func (r *IntrospectionResponse) GetRecoveryGeneration() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.RecoveryGeneration
+}
+
+// GetGeneration returns the authorization-code recovery generation.
+func (r *IntrospectionResponse) GetGeneration() uint64 {
+	return r.GetRecoveryGeneration()
+}
+
+// GetAuthorizationCodeStatus returns the authorization-code lifecycle state.
+func (r *IntrospectionResponse) GetAuthorizationCodeStatus() string {
+	if r == nil {
+		return ""
+	}
+	return r.AuthorizationCodeStatus
+}
+
+// GetCodeStatus returns the authorization-code lifecycle state.
+func (r *IntrospectionResponse) GetCodeStatus() string {
+	return r.GetAuthorizationCodeStatus()
+}
+
+// GetAuthorizationCodeConsumed reports whether the authorization code was
+// consumed for the introspected token.
+func (r *IntrospectionResponse) GetAuthorizationCodeConsumed() bool {
+	if r == nil {
+		return false
+	}
+	return r.AuthorizationCodeConsumed || r.AuthorizationCodeUsed
+}
+
+// GetCodeConsumed reports whether the authorization code was consumed.
+func (r *IntrospectionResponse) GetCodeConsumed() bool {
+	return r.GetAuthorizationCodeConsumed()
+}
+
+// GetRejectionStage returns the stage that rejected the exchange, if any.
+func (r *IntrospectionResponse) GetRejectionStage() string {
+	if r == nil {
+		return ""
+	}
+	return r.RejectionStage
+}
+
+// GetRecoveryStage returns the last completed authorization-code stage.
+func (r *IntrospectionResponse) GetRecoveryStage() string {
+	if r == nil {
+		return ""
+	}
+	return r.RecoveryStage
 }

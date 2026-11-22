@@ -350,6 +350,10 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 		if isPAR, err := f.authorizeRequestFromPAR(ctx, r, request); err != nil {
 			return request, err
 		} else if isPAR {
+			// Old pushed-authorization sessions may predate the recovery
+			// metadata. Freeze it on read so the subsequent code issuance and
+			// token exchange still share one generation.
+			PrepareAuthorizeRequestMetadata(request)
 			// No need to continue
 			return request, nil
 		} else if configProvider, ok := f.Config.(PushedAuthorizeRequestConfigProvider); ok && configProvider.EnforcePushedAuthorize(ctx) {
@@ -427,6 +431,12 @@ func (f *Fosite) newAuthorizeRequest(ctx context.Context, r *http.Request, isPAR
 		// We're assuming that using less then, by default, 8 characters for the state can not be considered "unguessable"
 		return request, errorsx.WithStack(ErrInvalidState.WithHintf("Request parameter 'state' must be at least be %d characters long to ensure sufficient entropy.", f.GetMinParameterEntropy(ctx)))
 	}
+
+	// Freeze the client registration revision, the explicitly requested
+	// redirect URI and the recovery generation at authorization-admission
+	// time. IssueAuthorizeCode inherits these values instead of recomputing
+	// them after a client-secret rotation.
+	PrepareAuthorizeRequestMetadata(request)
 
 	return request, nil
 }

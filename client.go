@@ -88,6 +88,14 @@ type DefaultClient struct {
 	Scopes         []string `json:"scopes"`
 	Audience       []string `json:"audience"`
 	Public         bool     `json:"public"`
+
+	// Revision is an optional explicit client-registration revision. When it is
+	// empty, the revision is derived from the serialized client registration.
+	Revision string `json:"revision,omitempty"`
+	// Generation is an optional numeric client-registration generation. When
+	// it is zero, it is derived from Revision (or the registration
+	// fingerprint).
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 type DefaultOpenIDConnectClient struct {
@@ -127,6 +135,29 @@ func (c *DefaultClient) GetHashedSecret() []byte {
 
 func (c *DefaultClient) GetRotatedHashes() [][]byte {
 	return c.RotatedSecrets
+}
+
+// GetClientRevision returns the explicit client registration revision.
+func (c *DefaultClient) GetClientRevision() string {
+	if c == nil {
+		return ""
+	}
+	return c.Revision
+}
+
+// GetClientGeneration returns the explicit numeric client registration
+// generation.
+func (c *DefaultClient) GetClientGeneration() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.Generation
+}
+
+// GetClientAuthenticationVersion returns the explicit client authentication
+// revision. It is an alias for GetClientRevision.
+func (c *DefaultClient) GetClientAuthenticationVersion() string {
+	return c.GetClientRevision()
 }
 
 func (c *DefaultClient) GetScopes() Arguments {

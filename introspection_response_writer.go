@@ -230,5 +230,92 @@ func (f *Fosite) WriteIntrospectionResponse(ctx context.Context, rw http.Respons
 		response["username"] = r.GetAccessRequester().GetSession().GetUsername()
 	}
 
+	addIntrospectionRecoveryMetadata(response, r)
+
 	_ = json.NewEncoder(rw).Encode(response)
+}
+
+type introspectionRecoveryMetadataProvider interface {
+	GetClientVersion() string
+	GetClientRevision() string
+	GetClientGeneration() uint64
+	GetRecoveryGeneration() uint64
+	GetGeneration() uint64
+	GetAuthorizationCodeStatus() string
+	GetCodeStatus() string
+	GetRejectionStage() string
+}
+
+func addIntrospectionRecoveryMetadata(response map[string]interface{}, responder IntrospectionResponder) {
+	var clientVersion, clientRevision, codeStatus, rejectionStage string
+	var clientGeneration, recoveryGeneration, generation uint64
+
+	if metadata, ok := responder.(introspectionRecoveryMetadataProvider); ok {
+		clientVersion = metadata.GetClientVersion()
+		clientRevision = metadata.GetClientRevision()
+		clientGeneration = metadata.GetClientGeneration()
+		recoveryGeneration = metadata.GetRecoveryGeneration()
+		generation = metadata.GetGeneration()
+		codeStatus = metadata.GetAuthorizationCodeStatus()
+		if codeStatus == "" {
+			codeStatus = metadata.GetCodeStatus()
+		}
+		rejectionStage = metadata.GetRejectionStage()
+	}
+
+	requester := responder.GetAccessRequester()
+	if clientRevision == "" {
+		clientRevision = RequesterClientRevision(requester)
+	}
+	if clientVersion == "" {
+		clientVersion = clientRevision
+	}
+	if clientGeneration == 0 {
+		clientGeneration = RequesterClientGeneration(requester)
+	}
+	if recoveryGeneration == 0 {
+		recoveryGeneration = RequesterRecoveryGeneration(requester)
+	}
+	if generation == 0 {
+		generation = recoveryGeneration
+	}
+	if codeStatus == "" {
+		codeStatus = RequesterAuthorizeCodeStatus(requester)
+	}
+	if rejectionStage == "" {
+		rejectionStage = RequesterRejectionStage(requester)
+	}
+
+	if clientVersion != "" {
+		response["client_version"] = clientVersion
+		response["client_authentication_version"] = clientVersion
+	}
+	if clientRevision != "" {
+		response["client_revision"] = clientRevision
+	}
+	if clientGeneration != 0 {
+		response["client_generation"] = clientGeneration
+	}
+	if recoveryGeneration != 0 {
+		response["recovery_generation"] = recoveryGeneration
+	}
+	if generation != 0 {
+		response["generation"] = generation
+	}
+	if codeStatus != "" {
+		response["authorization_code_status"] = codeStatus
+		response["code_status"] = codeStatus
+		consumed := codeStatus == AuthorizeCodeStatusConsumed
+		response["authorization_code_consumed"] = consumed
+		response["code_consumed"] = consumed
+	}
+	if rejectionStage != "" {
+		response["rejection_stage"] = rejectionStage
+		response["failure_stage"] = rejectionStage
+	}
+	if stageProvider, ok := responder.(interface{ GetRecoveryStage() string }); ok {
+		if stage := stageProvider.GetRecoveryStage(); stage != "" {
+			response["recovery_stage"] = stage
+		}
+	}
 }

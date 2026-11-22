@@ -98,6 +98,35 @@ func NewMemoryStore() *MemoryStore {
 
 type StoreAuthorizeCode struct {
 	active bool
+	// Active is the exported, persisted mirror of active. Keeping both fields
+	// makes a consumed authorization code survive a snapshot/restart instead of
+	// being resurrected because a private field was dropped during encoding.
+	Active bool `json:"active"`
+	// Generation is the recovery generation shared by the code and its tokens.
+	Generation uint64 `json:"generation,omitempty"`
+	// RecoveryGeneration and CodeGeneration are aliases for Generation.
+	RecoveryGeneration uint64 `json:"recoveryGeneration,omitempty"`
+	CodeGeneration     uint64 `json:"codeGeneration,omitempty"`
+	// Consumed is the exported mirror of the consumption tombstone.
+	Consumed bool `json:"consumed,omitempty"`
+	// Invalidated is an alias that records the same tombstone.
+	Invalidated bool `json:"invalidated,omitempty"`
+	// ClientRevision is the client registration revision that issued, and later
+	// consumed, this code.
+	ClientRevision string `json:"clientRevision,omitempty"`
+	// ClientVersion is an alias for ClientRevision.
+	ClientVersion string `json:"clientVersion,omitempty"`
+	// Status is the authorization-code lifecycle state.
+	Status string `json:"status,omitempty"`
+	// AuthorizationCodeStatus and CodeStatus are aliases for Status.
+	AuthorizationCodeStatus string `json:"authorizationCodeStatus,omitempty"`
+	CodeStatus              string `json:"codeStatus,omitempty"`
+	// RedirectURI is the exact redirect URI frozen at authorization time.
+	RedirectURI string `json:"redirectUri,omitempty"`
+	// RejectionStage identifies the stage that rejected an exchange attempt.
+	RejectionStage string `json:"rejectionStage,omitempty"`
+	// ConsumedAt is when the code was invalidated.
+	ConsumedAt time.Time `json:"consumedAt,omitempty"`
 	fosite.Requester
 }
 
@@ -250,7 +279,59 @@ func (s *MemoryStore) CreateAuthorizeCodeSession(_ context.Context, code string,
 	s.authorizeCodesMutex.Lock()
 	defer s.authorizeCodesMutex.Unlock()
 
-	s.AuthorizeCodes[code] = StoreAuthorizeCode{active: true, Requester: req}
+	if req == nil {
+		s.AuthorizeCodes[code] = StoreAuthorizeCode{
+			active: true,
+			Active: true,
+			Status: fosite.AuthorizeCodeStatusActive,
+		}
+		return nil
+	}
+
+	generation := fosite.RequesterRecoveryGeneration(req)
+	if generation == 0 {
+		generation = fosite.EnsureRecoveryGeneration(req)
+	}
+	status := fosite.RequesterAuthorizeCodeStatus(req)
+	if status == "" {
+		status = fosite.AuthorizeCodeStatusActive
+		fosite.SetRequesterAuthorizeCodeStatus(req, status)
+	}
+	active := status != fosite.AuthorizeCodeStatusConsumed &&
+		status != fosite.AuthorizeCodeStatusInvalidated &&
+		status != fosite.AuthorizeCodeStatusRejected
+	if active && status != fosite.AuthorizeCodeStatusActive {
+		status = fosite.AuthorizeCodeStatusActive
+		fosite.SetRequesterAuthorizeCodeStatus(req, status)
+	}
+	clientRevision := fosite.RequesterClientRevision(req)
+	if clientRevision == "" {
+		if client := req.GetClient(); client != nil {
+			clientRevision = fosite.ClientRevision(client)
+			fosite.SetRequesterClientRevision(req, clientRevision)
+		}
+	}
+	redirectURI := fosite.RequesterAuthorizationRedirectURI(req)
+	if redirectURI == "" {
+		redirectURI = req.GetRequestForm().Get("redirect_uri")
+		fosite.SetRequesterAuthorizationRedirectURI(req, redirectURI)
+	}
+
+	s.AuthorizeCodes[code] = StoreAuthorizeCode{
+		active:                  active,
+		Active:                  active,
+		Consumed:                !active,
+		Generation:              generation,
+		RecoveryGeneration:      generation,
+		CodeGeneration:          generation,
+		ClientRevision:          clientRevision,
+		ClientVersion:           clientRevision,
+		Status:                  status,
+		AuthorizationCodeStatus: status,
+		CodeStatus:              status,
+		RedirectURI:             redirectURI,
+		Requester:               req,
+	}
 	return nil
 }
 
@@ -262,8 +343,8 @@ func (s *MemoryStore) GetAuthorizeCodeSession(_ context.Context, code string, _ 
 	if !ok {
 		return nil, fosite.ErrNotFound
 	}
-	if !rel.active {
-		return rel, fosite.ErrInvalidatedAuthorizeCode
+	if !rel.isActive() {
+		return rel.requester(), fosite.ErrInvalidatedAuthorizeCode
 	}
 
 	return rel.Requester, nil
@@ -277,9 +358,115 @@ func (s *MemoryStore) InvalidateAuthorizeCodeSession(ctx context.Context, code s
 	if !ok {
 		return fosite.ErrNotFound
 	}
+	if !rel.isActive() {
+		return fosite.ErrInvalidatedAuthorizeCode
+	}
 	rel.active = false
+	rel.Active = false
+	rel.Consumed = true
+	rel.Invalidated = true
+	rel.Status = fosite.AuthorizeCodeStatusConsumed
+	rel.AuthorizationCodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.CodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.ConsumedAt = time.Now().UTC()
+	if revision := fosite.ClientRevisionFromContext(ctx); revision != "" {
+		rel.ClientRevision = revision
+		rel.ClientVersion = revision
+		fosite.SetRequesterClientRevision(rel.Requester, revision)
+	}
+	fosite.SetRequesterAuthorizeCodeStatus(rel.Requester, fosite.AuthorizeCodeStatusConsumed)
+	fosite.SetRequesterAuthorizeCodeStage(rel.Requester, fosite.RecoveryStageAuthorizeCodeConsumed)
 	s.AuthorizeCodes[code] = rel
 	return nil
+}
+
+// ConsumeAuthorizeCodeSession atomically consumes an authorization code. It
+// returns the stored authorization request exactly once; every later call
+// returns fosite.ErrInvalidatedAuthorizeCode together with the tombstone.
+func (s *MemoryStore) ConsumeAuthorizeCodeSession(ctx context.Context, code string, _ fosite.Session) (fosite.Requester, error) {
+	s.authorizeCodesMutex.Lock()
+	defer s.authorizeCodesMutex.Unlock()
+
+	rel, ok := s.AuthorizeCodes[code]
+	if !ok {
+		return nil, fosite.ErrNotFound
+	}
+	if !rel.isActive() {
+		return rel.requester(), fosite.ErrInvalidatedAuthorizeCode
+	}
+
+	rel.active = false
+	rel.Active = false
+	rel.Consumed = true
+	rel.Invalidated = true
+	rel.Status = fosite.AuthorizeCodeStatusConsumed
+	rel.AuthorizationCodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.CodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.ConsumedAt = time.Now().UTC()
+	if revision := fosite.ClientRevisionFromContext(ctx); revision != "" {
+		rel.ClientRevision = revision
+		rel.ClientVersion = revision
+		fosite.SetRequesterClientRevision(rel.Requester, revision)
+	}
+	fosite.SetRequesterAuthorizeCodeStatus(rel.Requester, fosite.AuthorizeCodeStatusConsumed)
+	fosite.SetRequesterAuthorizeCodeStage(rel.Requester, fosite.RecoveryStageAuthorizeCodeConsumed)
+	s.AuthorizeCodes[code] = rel
+	return rel.Requester, nil
+}
+
+// TombstoneAuthorizeCodeSession records a fail-closed consumption tombstone
+// even when the regular claim path failed. The operation is idempotent.
+func (s *MemoryStore) TombstoneAuthorizeCodeSession(ctx context.Context, code string, reason string) error {
+	s.authorizeCodesMutex.Lock()
+	defer s.authorizeCodesMutex.Unlock()
+
+	rel, ok := s.AuthorizeCodes[code]
+	if !ok {
+		return fosite.ErrNotFound
+	}
+	if reason == "" {
+		reason = fosite.RecoveryStageTokenCreation
+	}
+
+	rel.active = false
+	rel.Active = false
+	rel.Consumed = true
+	rel.Invalidated = true
+	rel.Status = fosite.AuthorizeCodeStatusConsumed
+	rel.AuthorizationCodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.CodeStatus = fosite.AuthorizeCodeStatusConsumed
+	rel.RejectionStage = reason
+	if rel.ConsumedAt.IsZero() {
+		rel.ConsumedAt = time.Now().UTC()
+	}
+	if revision := fosite.ClientRevisionFromContext(ctx); revision != "" {
+		rel.ClientRevision = revision
+		rel.ClientVersion = revision
+		fosite.SetRequesterClientRevision(rel.Requester, revision)
+	}
+	fosite.SetRequesterAuthorizeCodeStatus(rel.Requester, fosite.AuthorizeCodeStatusConsumed)
+	fosite.SetRequesterAuthorizeCodeStage(rel.Requester, reason)
+	fosite.SetRequesterRejectionStage(rel.Requester, reason)
+	s.AuthorizeCodes[code] = rel
+	return nil
+}
+
+func (s StoreAuthorizeCode) isActive() bool {
+	return !s.Consumed && !s.Invalidated && (s.active || s.Active)
+}
+
+func (s StoreAuthorizeCode) requester() fosite.Requester {
+	if s.Requester != nil {
+		return s.Requester
+	}
+	return s
+}
+
+func (s StoreRefreshToken) requester() fosite.Requester {
+	if s.Requester != nil {
+		return s.Requester
+	}
+	return s
 }
 
 func (s *MemoryStore) CreatePKCERequestSession(_ context.Context, code string, req fosite.Requester) error {
@@ -363,9 +550,9 @@ func (s *MemoryStore) GetRefreshTokenSession(_ context.Context, signature string
 		return nil, fosite.ErrNotFound
 	}
 	if !rel.active {
-		return rel, fosite.ErrInactiveToken
+		return rel.requester(), fosite.ErrInactiveToken
 	}
-	return rel, nil
+	return rel.requester(), nil
 }
 
 func (s *MemoryStore) DeleteRefreshTokenSession(_ context.Context, signature string) error {
