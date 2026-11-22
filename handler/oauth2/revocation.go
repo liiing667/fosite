@@ -5,6 +5,7 @@ package oauth2
 
 import (
 	"context"
+	"time"
 
 	"github.com/ory/x/errorsx"
 
@@ -22,16 +23,18 @@ type TokenRevocationHandler struct {
 // RevokeToken implements https://tools.ietf.org/html/rfc7009#section-2.1
 // The token type hint indicates which token type check should be performed first.
 func (r *TokenRevocationHandler) RevokeToken(ctx context.Context, token string, tokenType fosite.TokenType, client fosite.Client) error {
-	discoveryFuncs := []func() (request fosite.Requester, err error){
-		func() (request fosite.Requester, err error) {
+	discoveryFuncs := []func() (request fosite.Requester, tokenUse fosite.TokenUse, signature string, err error){
+		func() (request fosite.Requester, tokenUse fosite.TokenUse, signature string, err error) {
 			// Refresh token
-			signature := r.RefreshTokenStrategy.RefreshTokenSignature(ctx, token)
-			return r.TokenRevocationStorage.GetRefreshTokenSession(ctx, signature, nil)
+			refreshSignature := r.RefreshTokenStrategy.RefreshTokenSignature(ctx, token)
+			request, err = r.TokenRevocationStorage.GetRefreshTokenSession(ctx, refreshSignature, nil)
+			return request, fosite.RefreshToken, refreshSignature, err
 		},
-		func() (request fosite.Requester, err error) {
+		func() (request fosite.Requester, tokenUse fosite.TokenUse, signature string, err error) {
 			// Access token
-			signature := r.AccessTokenStrategy.AccessTokenSignature(ctx, token)
-			return r.TokenRevocationStorage.GetAccessTokenSession(ctx, signature, nil)
+			accessSignature := r.AccessTokenStrategy.AccessTokenSignature(ctx, token)
+			request, err = r.TokenRevocationStorage.GetAccessTokenSession(ctx, accessSignature, nil)
+			return request, fosite.AccessToken, accessSignature, err
 		},
 	}
 
@@ -41,12 +44,19 @@ func (r *TokenRevocationHandler) RevokeToken(ctx context.Context, token string, 
 	}
 
 	var ar fosite.Requester
+	var matchedTokenUse fosite.TokenUse
+	var matchedSignature string
 	var err1, err2 error
-	if ar, err1 = discoveryFuncs[0](); err1 != nil {
-		ar, err2 = discoveryFuncs[1]()
+	if ar, matchedTokenUse, matchedSignature, err1 = discoveryFuncs[0](); err1 != nil {
+		ar, matchedTokenUse, matchedSignature, err2 = discoveryFuncs[1]()
 	}
 	// err2 can only be not nil if first err1 was not nil
 	if err2 != nil {
+		noSession := (errors.Is(err1, fosite.ErrNotFound) || errors.Is(err1, fosite.ErrInactiveToken)) &&
+			(errors.Is(err2, fosite.ErrNotFound) || errors.Is(err2, fosite.ErrInactiveToken))
+		if noSession && r.revokeStatelessJWT(ctx, token, client) {
+			return nil
+		}
 		return storeErrorsToRevocationError(err1, err2)
 	}
 
@@ -58,7 +68,78 @@ func (r *TokenRevocationHandler) RevokeToken(ctx context.Context, token string, 
 	err1 = r.TokenRevocationStorage.RevokeRefreshToken(ctx, requestID)
 	err2 = r.TokenRevocationStorage.RevokeAccessToken(ctx, requestID)
 
-	return storeErrorsToRevocationError(err1, err2)
+	if err := storeErrorsToRevocationError(err1, err2); err != nil {
+		return err
+	}
+
+	r.recordRevocation(ctx, token, matchedSignature, matchedTokenUse, client, requestID, ar)
+	return nil
+}
+
+func (r *TokenRevocationHandler) revokeStatelessJWT(ctx context.Context, token string, client fosite.Client) bool {
+	validator, ok := r.AccessTokenStrategy.(interface {
+		ValidateToken(ctx context.Context, token string) (clientID string, expiresAt time.Time, err error)
+	})
+	if !ok {
+		return false
+	}
+	clientID, expiresAt, err := validator.ValidateToken(ctx, token)
+	if err != nil {
+		return false
+	}
+	if clientID != "" && clientID != client.GetID() {
+		return false
+	}
+
+	signature := r.AccessTokenStrategy.AccessTokenSignature(ctx, token)
+	if recorder, ok := r.TokenRevocationStorage.(fosite.TokenRevocationRecorder); ok {
+		_ = recorder.RecordTokenRevocation(ctx, fosite.TokenRevocationRecord{
+			TokenDigest:    fosite.TokenDigest(token),
+			TokenSignature: signature,
+			ClientID:       client.GetID(),
+			TokenUse:       fosite.AccessToken,
+			RevokedAt:      time.Now().UTC(),
+			ExpiresAt:      expiresAt,
+			Source:         "token-revocation-handler-stateless",
+		})
+	}
+	if recorder, ok := r.TokenRevocationStorage.(fosite.TokenSignatureRevocationRecorder); ok {
+		_ = recorder.RecordTokenSignatureRevocation(ctx, signature, expiresAt)
+	}
+	return true
+}
+
+func (r *TokenRevocationHandler) recordRevocation(
+	ctx context.Context,
+	token string,
+	signature string,
+	tokenUse fosite.TokenUse,
+	client fosite.Client,
+	requestID string,
+	request fosite.Requester,
+) {
+	if recorder, ok := r.TokenRevocationStorage.(fosite.TokenRevocationRecorder); ok {
+		_ = recorder.RecordTokenRevocation(ctx, fosite.TokenRevocationRecord{
+			TokenDigest:    fosite.TokenDigest(token),
+			TokenSignature: signature,
+			ClientID:       client.GetID(),
+			TokenUse:       tokenUse,
+			RequestID:      requestID,
+			RevokedAt:      time.Now().UTC(),
+			ExpiresAt:      revocationExpiry(request, tokenUse),
+			Source:         "token-revocation-handler",
+		})
+	}
+	if recorder, ok := r.TokenRevocationStorage.(fosite.TokenSignatureRevocationRecorder); ok {
+		_ = recorder.RecordTokenSignatureRevocation(ctx, signature, revocationExpiry(request, tokenUse))
+	}
+}
+
+func revocationExpiry(request fosite.Requester, tokenUse fosite.TokenUse) time.Time {
+	if request == nil || request.GetSession() == nil {
+		return time.Time{}
+	}
+	return request.GetSession().GetExpiresAt(tokenUse)
 }
 
 func storeErrorsToRevocationError(err1, err2 error) error {

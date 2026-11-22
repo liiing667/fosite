@@ -95,18 +95,59 @@ import (
 //	Authorization: Basic czZCaGRSa3F0MzpnWDFmQmF0M2JW
 //
 //	token=mF_9.B5f-4.1JqM&token_type_hint=access_token
-func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, session Session) (_ IntrospectionResponder, err error) {
+func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, session Session) (IntrospectionResponder, error) {
+	responder, report, err := f.NewIntrospectionRequestWithReport(ctx, r, session)
+	if response, ok := responder.(*IntrospectionResponse); ok && response != nil {
+		response.Report = report
+	}
+	return responder, err
+}
+
+// NewIntrospectionRequestWithReport behaves like NewIntrospectionRequest but
+// additionally returns a TokenStatusReport containing the token digest,
+// client, status source and revocation generation. The report is suitable for
+// audit logs and tests; it is never included in the introspection response.
+func (f *Fosite) NewIntrospectionRequestWithReport(ctx context.Context, r *http.Request, session Session) (responder IntrospectionResponder, report TokenStatusReport, err error) {
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/fosite").Start(ctx, "Fosite.NewIntrospectionRequest")
 	defer otelx.End(span, &err)
+
+	defer func() {
+		if report.TokenDigest == "" {
+			if token := r.PostForm.Get("token"); token != "" {
+				report.TokenDigest = TokenDigest(token)
+			}
+		}
+		if err != nil {
+			report.Active = false
+			if report.Stage == "" {
+				report.Stage = TokenStatusStageIntrospection
+			}
+			if report.Error == "" {
+				report.Error = err.Error()
+			}
+		}
+		if report.Source == "" {
+			report.Source = report.Stage
+		}
+		if report.StatusSource == "" {
+			report.StatusSource = report.Source
+		}
+		if report.Stage != "" && report.Stage != TokenStatusStageRevoked && report.Stage != TokenStatusStageActive {
+			report.FailureLocation = report.Stage
+		}
+		if response, ok := responder.(*IntrospectionResponse); ok && response != nil {
+			response.Report = report
+		}
+	}()
 
 	ctx = context.WithValue(ctx, RequestContextKey, r)
 
 	if r.Method != "POST" {
-		return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrInvalidRequest.WithHintf("HTTP method is '%s' but expected 'POST'.", r.Method))
+		return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrInvalidRequest.WithHintf("HTTP method is '%s' but expected 'POST'.", r.Method))
 	} else if err := r.ParseMultipartForm(1 << 20); err != nil && err != http.ErrNotMultipart {
-		return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrInvalidRequest.WithHint("Unable to parse HTTP body, make sure to send a properly formatted form request body.").WithWrap(err).WithDebug(err.Error()))
+		return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrInvalidRequest.WithHint("Unable to parse HTTP body, make sure to send a properly formatted form request body.").WithWrap(err).WithDebug(err.Error()))
 	} else if len(r.PostForm) == 0 {
-		return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrInvalidRequest.WithHint("The POST body can not be empty."))
+		return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrInvalidRequest.WithHint("The POST body can not be empty."))
 	}
 
 	token := r.PostForm.Get("token")
@@ -114,44 +155,75 @@ func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, s
 	scope := r.PostForm.Get("scope")
 	if clientToken := AccessTokenFromRequest(r); clientToken != "" {
 		if token == clientToken {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Bearer and introspection token are identical."))
+			report.Stage = TokenStatusStageAuthentication
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Bearer and introspection token are identical."))
 		}
 
 		if tu, _, err := f.IntrospectToken(ctx, clientToken, AccessToken, session.Clone()); err != nil {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("HTTP Authorization header missing, malformed, or credentials used are invalid."))
+			report.Stage = TokenStatusStageAuthentication
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("HTTP Authorization header missing, malformed, or credentials used are invalid."))
 		} else if tu != "" && tu != AccessToken {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHintf("HTTP Authorization header did not provide a token of type 'access_token', got type '%s'.", tu))
+			report.Stage = TokenStatusStageAuthentication
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHintf("HTTP Authorization header did not provide a token of type 'access_token', got type '%s'.", tu))
 		}
 	} else {
 		id, secret, ok := r.BasicAuth()
 		if !ok {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("HTTP Authorization header missing."))
+			report.Stage = TokenStatusStageAuthentication
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("HTTP Authorization header missing."))
 		}
 
 		clientID, err := url.QueryUnescape(id)
 		if err != nil {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to decode OAuth 2.0 Client ID from HTTP basic authorization header, make sure it is properly encoded.").WithWrap(err).WithDebug(err.Error()))
+			report.Stage = TokenStatusStageAuthentication
+			report.ClientID = id
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to decode OAuth 2.0 Client ID from HTTP basic authorization header, make sure it is properly encoded.").WithWrap(err).WithDebug(err.Error()))
 		}
 
 		clientSecret, err := url.QueryUnescape(secret)
 		if err != nil {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to decode OAuth 2.0 Client Secret from HTTP basic authorization header, make sure it is properly encoded.").WithWrap(err).WithDebug(err.Error()))
+			report.Stage = TokenStatusStageAuthentication
+			report.ClientID = clientID
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to decode OAuth 2.0 Client Secret from HTTP basic authorization header, make sure it is properly encoded.").WithWrap(err).WithDebug(err.Error()))
 		}
 
 		client, err := f.Store.GetClient(ctx, clientID)
 		if err != nil {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find OAuth 2.0 Client from HTTP basic authorization header.").WithWrap(err).WithDebug(err.Error()))
+			report.Stage = TokenStatusStageAuthentication
+			report.ClientID = clientID
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find OAuth 2.0 Client from HTTP basic authorization header.").WithWrap(err).WithDebug(err.Error()))
 		}
 
 		// Enforce client authentication
 		if err := f.checkClientSecret(ctx, client, []byte(clientSecret)); err != nil {
-			return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrRequestUnauthorized.WithHint("OAuth 2.0 Client credentials are invalid."))
+			report.Stage = TokenStatusStageAuthentication
+			report.ClientID = clientID
+			return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrRequestUnauthorized.WithHint("OAuth 2.0 Client credentials are invalid."))
 		}
+		report.ClientID = clientID
 	}
 
-	tu, ar, err := f.IntrospectToken(ctx, token, TokenUse(tokenTypeHint), session, RemoveEmpty(strings.Split(scope, " "))...)
+	tu, ar, source, err := f.introspectToken(ctx, token, TokenUse(tokenTypeHint), session, RemoveEmpty(strings.Split(scope, " "))...)
 	if err != nil {
-		return &IntrospectionResponse{Active: false}, errorsx.WithStack(ErrInactiveToken.WithHint("An introspection strategy indicated that the token is inactive.").WithWrap(err).WithDebug(err.Error()))
+		report.TokenDigest = TokenDigest(token)
+		report.Source = source
+		report.Active = false
+		if provider, ok := f.Store.(TokenRevocationStateProvider); ok {
+			if record, recordErr := provider.GetTokenRevocationState(ctx, report.TokenDigest); recordErr == nil {
+				report.Generation = record.Generation
+				report.RevocationGeneration = record.RevocationGeneration
+				report.RevokedAt = record.RevokedAt
+				report.TokenSignature = record.TokenSignature
+				report.Revoked = true
+				if record.Source != "" {
+					report.StatusSource = record.Source
+				}
+				if record.TokenUse != "" {
+					report.TokenUse = record.TokenUse
+				}
+			}
+		}
+		return &IntrospectionResponse{Active: false}, report, errorsx.WithStack(ErrInactiveToken.WithHint("An introspection strategy indicated that the token is inactive.").WithWrap(err).WithDebug(err.Error()))
 	}
 	accessTokenType := ""
 
@@ -159,20 +231,51 @@ func (f *Fosite) NewIntrospectionRequest(ctx context.Context, r *http.Request, s
 		accessTokenType = BearerAccessToken
 	}
 
+	report.TokenDigest = TokenDigest(token)
+	report.TokenUse = tu
+	report.Active = true
+	report.Source = source
+	report.Stage = TokenStatusStageActive
+	if ar != nil && ar.GetClient() != nil && ar.GetClient().GetID() != "" {
+		report.ClientID = ar.GetClient().GetID()
+	}
+	if provider, ok := f.Store.(TokenRevocationStateProvider); ok {
+		if record, recordErr := provider.GetTokenRevocationState(ctx, report.TokenDigest); recordErr == nil {
+			report.Generation = record.Generation
+			report.RevocationGeneration = record.RevocationGeneration
+			report.RevokedAt = record.RevokedAt
+			report.TokenSignature = record.TokenSignature
+			if record.Source != "" {
+				report.StatusSource = record.Source
+			}
+			if record.TokenUse != "" {
+				report.TokenUse = record.TokenUse
+			}
+		}
+	}
+	if report.StatusSource == "" {
+		report.StatusSource = report.Source
+	}
+	if report.Stage != TokenStatusStageRevoked && report.Stage != TokenStatusStageActive {
+		report.FailureLocation = report.Stage
+	}
+
 	return &IntrospectionResponse{
 		Active:          true,
 		AccessRequester: ar,
 		TokenUse:        tu,
 		AccessTokenType: accessTokenType,
-	}, nil
+		Report:          report,
+	}, report, nil
 }
 
 type IntrospectionResponse struct {
-	Active          bool            `json:"active"`
-	AccessRequester AccessRequester `json:"extra"`
-	TokenUse        TokenUse        `json:"token_use,omitempty"`
-	AccessTokenType string          `json:"token_type,omitempty"`
-	Lang            language.Tag    `json:"-"`
+	Active          bool              `json:"active"`
+	AccessRequester AccessRequester   `json:"extra"`
+	TokenUse        TokenUse          `json:"token_use,omitempty"`
+	AccessTokenType string            `json:"token_type,omitempty"`
+	Lang            language.Tag      `json:"-"`
+	Report          TokenStatusReport `json:"-"`
 }
 
 func (r *IntrospectionResponse) IsActive() bool {
@@ -189,4 +292,11 @@ func (r *IntrospectionResponse) GetTokenUse() TokenUse {
 
 func (r *IntrospectionResponse) GetAccessTokenType() string {
 	return r.AccessTokenType
+}
+
+// GetReport returns the audit evidence collected for this introspection
+// request. It contains the token digest, client, status source and revocation
+// generation, and is never serialized into the RFC 7662 response.
+func (r *IntrospectionResponse) GetReport() TokenStatusReport {
+	return r.Report
 }

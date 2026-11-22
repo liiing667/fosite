@@ -5,7 +5,10 @@ package oauth2
 
 import (
 	"context"
+	"strings"
 	"time"
+
+	"github.com/ory/x/errorsx"
 
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/token/jwt"
@@ -16,6 +19,20 @@ type StatelessJWTValidator struct {
 	Config interface {
 		fosite.ScopeStrategyProvider
 	}
+	// Storage is optional. When set and it implements one of fosite's
+	// revocation checker interfaces, the corresponding durable revocation
+	// evidence is consulted before the token is reported active.
+	Storage interface {
+		GetAccessTokenSession(ctx context.Context, signature string, session fosite.Session) (fosite.Requester, error)
+	}
+	// SignatureRevocationChecker is optional. When configured, a JWT whose
+	// signature has a durable revocation marker is reported as inactive. The
+	// marker is independent of the access token session, so the result stays
+	// the same after a restart and for tokens that are not stored at all.
+	SignatureRevocationChecker fosite.TokenSignatureRevocationChecker
+	// TokenRevocationChecker is optional. It covers revocation evidence that
+	// is keyed by the token digest rather than by the JWT signature.
+	TokenRevocationChecker fosite.TokenRevocationChecker
 }
 
 // AccessTokenJWTToRequest tries to reconstruct fosite.Request from a JWT.
@@ -74,6 +91,39 @@ func (v *StatelessJWTValidator) IntrospectToken(ctx context.Context, token strin
 		return "", err
 	}
 
+	signatureRevocationChecker := v.SignatureRevocationChecker
+	if signatureRevocationChecker == nil {
+		if checker, ok := v.Storage.(fosite.TokenSignatureRevocationChecker); ok {
+			signatureRevocationChecker = checker
+		}
+	}
+	if signatureRevocationChecker != nil {
+		if signature := jwtTokenSignature(token); signature != "" {
+			revoked, err := signatureRevocationChecker.IsTokenSignatureRevoked(ctx, signature)
+			if err != nil {
+				return "", errorsx.WithStack(err)
+			}
+			if revoked {
+				return fosite.AccessToken, errorsx.WithStack(fosite.ErrInactiveToken.WithHint("The access token has been revoked."))
+			}
+		}
+	}
+	tokenRevocationChecker := v.TokenRevocationChecker
+	if tokenRevocationChecker == nil {
+		if checker, ok := v.Storage.(fosite.TokenRevocationChecker); ok {
+			tokenRevocationChecker = checker
+		}
+	}
+	if tokenRevocationChecker != nil {
+		revoked, err := tokenRevocationChecker.IsTokenRevoked(ctx, fosite.TokenDigest(token))
+		if err != nil {
+			return "", errorsx.WithStack(err)
+		}
+		if revoked {
+			return fosite.AccessToken, errorsx.WithStack(fosite.ErrInactiveToken.WithHint("The access token has been revoked."))
+		}
+	}
+
 	// TODO: From here we assume it is an access token, but how do we know it is really and that is not an ID token?
 
 	requester := AccessTokenJWTToRequest(t)
@@ -85,4 +135,12 @@ func (v *StatelessJWTValidator) IntrospectToken(ctx context.Context, token strin
 	accessRequest.Merge(requester)
 
 	return fosite.AccessToken, nil
+}
+
+func jwtTokenSignature(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	return parts[2]
 }

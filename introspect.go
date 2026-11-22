@@ -5,6 +5,7 @@ package fosite
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -42,8 +43,14 @@ func (f *Fosite) IntrospectToken(ctx context.Context, token string, tokenUse Tok
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer("github.com/ory/fosite").Start(ctx, "Fosite.IntrospectToken")
 	defer otelx.End(span, &err)
 
+	tu, ar, _, err := f.introspectToken(ctx, token, tokenUse, session, scopes...)
+	return tu, ar, err
+}
+
+func (f *Fosite) introspectToken(ctx context.Context, token string, tokenUse TokenUse, session Session, scopes ...string) (TokenUse, AccessRequester, string, error) {
 	var found = false
 	var foundTokenUse TokenUse = ""
+	var source string
 
 	ar := NewAccessRequest(session)
 	for _, validator := range f.Config.GetTokenIntrospectionHandlers(ctx) {
@@ -51,17 +58,18 @@ func (f *Fosite) IntrospectToken(ctx context.Context, token string, tokenUse Tok
 		if err == nil {
 			found = true
 			foundTokenUse = tu
+			source = fmt.Sprintf("%T", validator)
 		} else if errors.Is(err, ErrUnknownRequest) {
 			// do nothing
 		} else {
 			rfcerr := ErrorToRFC6749Error(err)
-			return "", nil, errorsx.WithStack(rfcerr)
+			return "", nil, fmt.Sprintf("%T", validator), errorsx.WithStack(rfcerr)
 		}
 	}
 
 	if !found {
-		return "", nil, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find a suitable validation strategy for the token, thus it is invalid."))
+		return "", nil, source, errorsx.WithStack(ErrRequestUnauthorized.WithHint("Unable to find a suitable validation strategy for the token, thus it is invalid."))
 	}
 
-	return foundTokenUse, ar, nil
+	return foundTokenUse, ar, source, nil
 }

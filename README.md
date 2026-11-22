@@ -467,8 +467,13 @@ direction.
 
 ### JWT Introspection
 
-Please note that when using the OAuth2StatelessJWTIntrospectionFactory access
-token revocation is not possible.
+`OAuth2StatelessJWTIntrospectionFactory` validates the JWT without loading an
+access token session. If the storage implements
+`fosite.TokenSignatureRevocationChecker` or `fosite.TokenRevocationChecker`,
+the factory also honors the durable revocation markers written by the
+revocation endpoint, so revoked JWTs stay inactive across restarts. Stores
+that do not implement the optional interfaces retain the previous stateless
+behavior.
 
 ## Contribute
 

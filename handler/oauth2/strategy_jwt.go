@@ -38,6 +38,19 @@ func (h DefaultJWTStrategy) AccessTokenSignature(ctx context.Context, token stri
 	return h.signature(token)
 }
 
+// ValidateToken validates a JWT access token without loading a stored token
+// session. It returns the client ID from the token claims and the access token
+// expiry. This is used for revocation requests against stateless JWTs, where
+// no access token session exists to look up a request ID.
+func (h *DefaultJWTStrategy) ValidateToken(ctx context.Context, token string) (clientID string, expiresAt time.Time, err error) {
+	parsed, err := validate(ctx, h.Signer, token)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	requester := AccessTokenJWTToRequest(parsed)
+	return requester.GetClient().GetID(), requester.GetSession().GetExpiresAt(fosite.AccessToken), nil
+}
+
 func (h *DefaultJWTStrategy) GenerateAccessToken(ctx context.Context, requester fosite.Requester) (token string, signature string, err error) {
 	return h.generate(ctx, fosite.AccessToken, requester)
 }
