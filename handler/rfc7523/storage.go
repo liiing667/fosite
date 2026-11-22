@@ -29,5 +29,9 @@ type RFC7523KeyStorage interface {
 	// MarkJWTUsedForTime marks JWT as used for a time passed in exp parameter. This helps ensure that JWTs are not
 	// replayed by maintaining the set of used "jti" values for the length of time for which the JWT would be
 	// considered valid based on the applicable "exp" instant. (https://tools.ietf.org/html/rfc7523#section-3)
+	//
+	// Implementations must mark the jti atomically: if the jti was already marked as used (and is not yet
+	// expired), MarkJWTUsedForTime must return fosite.ErrJTIKnown and must not consume the jti again. This
+	// guarantees that a JWT assertion can be exchanged for a token only once, even under concurrent requests.
 	MarkJWTUsedForTime(ctx context.Context, jti string, exp time.Time) error
 }

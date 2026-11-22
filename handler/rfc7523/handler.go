@@ -5,6 +5,7 @@ package rfc7523
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -94,6 +95,13 @@ func (c *Handler) HandleTokenEndpointRequest(ctx context.Context, request fosite
 
 	if claims.ID != "" {
 		if err := c.Storage.MarkJWTUsedForTime(ctx, claims.ID, claims.Expiry.Time()); err != nil {
+			if errors.Is(err, fosite.ErrJTIKnown) {
+				// The jti was consumed by a concurrent request after this request
+				// passed the IsJWTUsed check. The jti of a verified assertion must
+				// only be consumed once, so reject the replay with the same error
+				// as the pre-check above instead of a server error.
+				return errorsx.WithStack(fosite.ErrJTIKnown)
+			}
 			return errorsx.WithStack(fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 		}
 	}
