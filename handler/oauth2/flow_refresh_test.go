@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -917,4 +918,90 @@ func TestRefreshFlowTransactional_PopulateTokenEndpointResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRefreshFlow_ConcurrentRequestsLeaveSingleGeneration runs the full
+// refresh grant (hydration + rotation + persistence) for many concurrent
+// requests presenting the same refresh token. Only one request may commit a
+// new generation; every competing request must be rejected with a retryable
+// invalid request instead of leaving two valid token pairs behind.
+func TestRefreshFlow_ConcurrentRequestsLeaveSingleGeneration(t *testing.T) {
+	store := storage.NewMemoryStore()
+	config := &fosite.Config{
+		AccessTokenLifespan:      time.Hour,
+		RefreshTokenLifespan:     time.Hour,
+		ScopeStrategy:            fosite.HierarchicScopeStrategy,
+		AudienceMatchingStrategy: fosite.DefaultAudienceMatchingStrategy,
+		RefreshTokenScopes:       []string{},
+	}
+	handler := &RefreshTokenGrantHandler{
+		TokenRevocationStorage: store,
+		AccessTokenStrategy:    hmacshaStrategy,
+		RefreshTokenStrategy:   hmacshaStrategy,
+		Config:                 config,
+	}
+
+	refreshToken, refreshSignature, err := hmacshaStrategy.GenerateRefreshToken(context.Background(), nil)
+	require.NoError(t, err)
+
+	original := &fosite.Request{
+		ID:             "the-request-id",
+		Client:         &fosite.DefaultClient{ID: "foo", GrantTypes: fosite.Arguments{"refresh_token"}, Scopes: []string{"foo", "offline"}},
+		GrantedScope:   fosite.Arguments{"foo", "offline"},
+		RequestedScope: fosite.Arguments{"foo", "offline"},
+		Form:           url.Values{},
+		RequestedAt:    time.Now().UTC().Add(-time.Hour),
+		Session:        &fosite.DefaultSession{Subject: "othersub"},
+	}
+	require.NoError(t, store.CreateRefreshTokenSession(context.Background(), refreshSignature, "", original))
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	var successCount, failureCount int
+	var mu sync.Mutex
+
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+
+			areq := fosite.NewAccessRequest(&fosite.DefaultSession{})
+			areq.GrantTypes = fosite.Arguments{"refresh_token"}
+			areq.Client = original.Client
+			areq.Form = url.Values{"refresh_token": {refreshToken}}
+
+			if err := handler.HandleTokenEndpointRequest(context.Background(), areq); err != nil {
+				mu.Lock()
+				failureCount++
+				mu.Unlock()
+				return
+			}
+
+			aresp := fosite.NewAccessResponse()
+			if err := handler.PopulateTokenEndpointResponse(context.Background(), areq, aresp); err != nil {
+				mu.Lock()
+				failureCount++
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			successCount++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 1, successCount, "only a single concurrent refresh may produce a new generation")
+	assert.Equal(t, goroutines-1, failureCount)
+
+	// A retry of the now rotated token must be treated as reuse, not silently
+	// accepted, so no additional generation can ever be created from it.
+	retry := fosite.NewAccessRequest(&fosite.DefaultSession{})
+	retry.GrantTypes = fosite.Arguments{"refresh_token"}
+	retry.Client = original.Client
+	retry.Form = url.Values{"refresh_token": {refreshToken}}
+	err = handler.HandleTokenEndpointRequest(context.Background(), retry)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, fosite.ErrInvalidGrant), "reusing a rotated token must be an invalid grant error: %v", err)
 }

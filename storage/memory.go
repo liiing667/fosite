@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
+	"github.com/mohae/deepcopy"
 
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/internal"
@@ -105,6 +106,18 @@ type StoreRefreshToken struct {
 	active               bool
 	accessTokenSignature string
 	fosite.Requester
+}
+
+// cloneRequester returns a deep copy of the supplied requester. The in-memory
+// store keeps no shared pointers with its callers: without this copy, the
+// session (and therefore the OpenID Connect ID token claims) of a stored
+// generation could be mutated in place by a concurrently running refresh,
+// mixing claims of different token generations.
+func cloneRequester(req fosite.Requester) fosite.Requester {
+	if req == nil {
+		return nil
+	}
+	return deepcopy.Copy(req).(fosite.Requester)
 }
 
 func NewExampleStore() *MemoryStore {
@@ -317,7 +330,7 @@ func (s *MemoryStore) CreateAccessTokenSession(_ context.Context, signature stri
 	s.accessTokensMutex.Lock()
 	defer s.accessTokensMutex.Unlock()
 
-	s.AccessTokens[signature] = req
+	s.AccessTokens[signature] = cloneRequester(req)
 	s.AccessTokenRequestIDs[req.GetID()] = signature
 	return nil
 }
@@ -330,7 +343,7 @@ func (s *MemoryStore) GetAccessTokenSession(_ context.Context, signature string,
 	if !ok {
 		return nil, fosite.ErrNotFound
 	}
-	return rel, nil
+	return cloneRequester(rel), nil
 }
 
 func (s *MemoryStore) DeleteAccessTokenSession(_ context.Context, signature string) error {
@@ -349,7 +362,7 @@ func (s *MemoryStore) CreateRefreshTokenSession(_ context.Context, signature, ac
 	s.refreshTokensMutex.Lock()
 	defer s.refreshTokensMutex.Unlock()
 
-	s.RefreshTokens[signature] = StoreRefreshToken{active: true, Requester: req, accessTokenSignature: accessTokenSignature}
+	s.RefreshTokens[signature] = StoreRefreshToken{active: true, Requester: cloneRequester(req), accessTokenSignature: accessTokenSignature}
 	s.RefreshTokenRequestIDs[req.GetID()] = signature
 	return nil
 }
@@ -363,9 +376,9 @@ func (s *MemoryStore) GetRefreshTokenSession(_ context.Context, signature string
 		return nil, fosite.ErrNotFound
 	}
 	if !rel.active {
-		return rel, fosite.ErrInactiveToken
+		return cloneRequester(rel.Requester), fosite.ErrInactiveToken
 	}
-	return rel, nil
+	return cloneRequester(rel.Requester), nil
 }
 
 func (s *MemoryStore) DeleteRefreshTokenSession(_ context.Context, signature string) error {
@@ -409,16 +422,51 @@ func (s *MemoryStore) RevokeRefreshToken(ctx context.Context, requestID string) 
 	return nil
 }
 
+// rotateRefreshTokenAtomically deactivates the presented refresh token only
+// while it is still the active generation of the request. The check and the
+// state change happen under a single pair of locks so two concurrent
+// refreshes presenting the same refresh token can not both succeed. The losing
+// request receives fosite.ErrSerializationFailure which the refresh grant
+// handler maps to a retryable invalid request, leaving the winning generation
+// as the single recoverable one.
+func (s *MemoryStore) rotateRefreshTokenAtomically(requestID, refreshTokenSignature string) error {
+	// We first lock refreshTokenRequestIDsMutex and then refreshTokensMutex
+	// because this is the same order used by CreateRefreshTokenSession and
+	// RevokeRefreshToken, which prevents deadlocks.
+	s.refreshTokenRequestIDsMutex.Lock()
+	defer s.refreshTokenRequestIDsMutex.Unlock()
+	s.refreshTokensMutex.Lock()
+	defer s.refreshTokensMutex.Unlock()
+
+	rel, ok := s.RefreshTokens[refreshTokenSignature]
+	if !ok {
+		return fosite.ErrNotFound
+	}
+	if !rel.active {
+		return fosite.ErrSerializationFailure
+	}
+	// The presented refresh token must be the active generation of the request
+	// it belongs to. Otherwise the caller is trying to rotate a token of a
+	// different family with someone else's request id.
+	if mappedSignature, exists := s.RefreshTokenRequestIDs[requestID]; exists && mappedSignature != refreshTokenSignature {
+		return fosite.ErrSerializationFailure
+	}
+
+	rel.active = false
+	s.RefreshTokens[refreshTokenSignature] = rel
+
+	return nil
+}
+
 func (s *MemoryStore) RevokeAccessToken(ctx context.Context, requestID string) error {
 	s.accessTokenRequestIDsMutex.RLock()
-	defer s.accessTokenRequestIDsMutex.RUnlock()
-
-	if signature, exists := s.AccessTokenRequestIDs[requestID]; exists {
-		if err := s.DeleteAccessTokenSession(ctx, signature); err != nil {
-			return err
-		}
+	signature, exists := s.AccessTokenRequestIDs[requestID]
+	s.accessTokenRequestIDsMutex.RUnlock()
+	if !exists {
+		return nil
 	}
-	return nil
+
+	return s.DeleteAccessTokenSession(ctx, signature)
 }
 
 func (s *MemoryStore) GetPublicKey(ctx context.Context, issuer string, subject string, keyId string) (*jose.JSONWebKey, error) {
@@ -519,11 +567,16 @@ func (s *MemoryStore) DeletePARSession(ctx context.Context, requestURI string) (
 }
 
 func (s *MemoryStore) RotateRefreshToken(ctx context.Context, requestID string, refreshTokenSignature string) (err error) {
-	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
-	// the Ory Hydra implementation for reference.
-	if err := s.RevokeRefreshToken(ctx, requestID); err != nil {
+	// Atomically deactivate the presented refresh token while it is still the
+	// active generation. Concurrent refreshes race here: exactly one wins and
+	// continues, every other request receives a serialization failure instead
+	// of committing a second, independently verifiable generation.
+	if err := s.rotateRefreshTokenAtomically(requestID, refreshTokenSignature); err != nil {
 		return err
 	}
+
+	// Graceful token rotation can be implemented here but it's beyond the scope of this example. Check
+	// the Ory Hydra implementation for reference.
 	return s.RevokeAccessToken(ctx, requestID)
 }
 
